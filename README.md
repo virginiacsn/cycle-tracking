@@ -32,7 +32,6 @@ make data
 ├── notebooks/             <- Exploratory notebooks (not production code)
 ├── reports/figures/       <- Generated figures
 ├── models/                <- Serialized models
-├── docs/                  <- MkDocs documentation
 └── src/
     ├── config.py          <- Paths, env vars, logger
     ├── dataset.py         <- Raw → processed pipeline (Typer CLI)
