@@ -56,3 +56,7 @@ pipenv run python src/dataset.py
 ```
 
 See `.context/plan.md` for current task status and `.rules/` for coding standards.
+
+## Dataset
+
+Lin, B., Li, J. Y., Kalani, K., Truong, K., & Mariakakis, A. (2025). mcPHASES: A Dataset of Physiological, Hormonal, and Self-reported Events and Symptoms for Menstrual Health Tracking with Wearables (version 1.0.0). *PhysioNet*. https://doi.org/10.13026/zx6a-2c81

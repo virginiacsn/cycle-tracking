@@ -16,18 +16,35 @@
   - Interday data: hormones_and_selfreport, sleep, resting_heart_rate, heart_rate_variability_details, computed_temperature, active_minutes
     - Hormones: keep lh and estrogen
     - Sleep data: keep total sleep duration and sleep stage durations
-    - Computed temperature: keep nightly temperature variable
+    - Computed temperature: keep nightly temperature and baseline_relative_sample_sum variables
     - Heart rate variability details: keep daily mean, min and max of rmssd variable
 - [x] Filter data keeping 2022 study interval, start from first day of sleep data
 - [x] Remove cycles with 4 consecutive days of hormone data missing or more than 40% of hormone data missing
 - [x] Remove days with less than 18 hours of intraday data
 - [x] Sample intraday data to 5-minute intervals using mean aggregation, linearly interpolate missing values for heart rate and glucose, fill with 0 for active zone minutes
 - [x] Save processed intraday and interday data as separate CSV files in `data/processed/`
-- [x] Create notebook for initial data exploration (`notebooks/data-exploration.ipynb`)
+- [x] Create notebook for initial data exploration (`notebooks/initial-exploration.ipynb`)
 
 ### Phase 2: Feature Engineering
 
-- [ ] Define features relevant to cycle analysis
+Interday and intraday features:
+
+- [ ] Cycle count, cycle day count and % of cycle progress
+
+Interday features:
+
+- [ ] Estrogen-to-lh ratio
+- [ ] LH deviation from baseline (?)
+- [ ] Total active minutes
+- [ ] Sleep efficiency ratios - deep/total and rem/total
+- [ ] Nightly temperature deviation from baseline (?)
+- [ ] Convert reports to numeric values following Likert-type scale (0-5)
+
+Intraday features:
+
+- [ ] Time of day - morning/afternoon/evening/night
+- [ ] Add cycle phase labels from interday dataset
+
 - [ ] Implement feature engineering in `src/features.py`
 
 ### Phase 3: Modeling

@@ -186,8 +186,19 @@ def _load_computed_temperature() -> pd.DataFrame:
     df = pd.read_csv(RAW_DATA_DIR / "computed_temperature.csv")
     df = df[df["study_interval"] == STUDY_INTERVAL].copy()
     df = df[
-        ["id", "sleep_start_day_in_study", "temperature_samples", "nightly_temperature"]
-    ].rename(columns={"sleep_start_day_in_study": "day_in_study"})
+        [
+            "id",
+            "sleep_start_day_in_study",
+            "temperature_samples",
+            "nightly_temperature",
+            "baseline_relative_sample_sum",
+        ]
+    ].rename(
+        columns={
+            "sleep_start_day_in_study": "day_in_study",
+            "baseline_relative_sample_sum": "temperature_deviation",
+        }
+    )
     # Same-day duplicates arise from nap + overnight sessions; keep the better-sampled one.
     df = df.sort_values("temperature_samples", ascending=False).drop_duplicates(
         subset=["id", "day_in_study"], keep="first"
