@@ -196,7 +196,8 @@ def _load_computed_temperature() -> pd.DataFrame:
     ].rename(
         columns={
             "sleep_start_day_in_study": "day_in_study",
-            "baseline_relative_sample_sum": "temperature_deviation",
+            "nightly_temperature": "temperature",
+            "baseline_relative_sample_sum": "temperature_dev",
         }
     )
     # Same-day duplicates arise from nap + overnight sessions; keep the better-sampled one.
