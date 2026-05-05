@@ -16,7 +16,7 @@
   - Interday data: hormones_and_selfreport, sleep, resting_heart_rate, heart_rate_variability_details, computed_temperature, active_minutes
     - Hormones: keep lh and estrogen
     - Sleep data: keep total sleep duration and sleep stage durations
-    - Computed temperature: keep nightly temperature and baseline_relative_sample_sum variable
+    - Computed temperature: keep nightly temperature and baseline_relative_sample_sum variables
     - Heart rate variability details: keep daily mean, min and max of rmssd variable
 - [x] Filter data keeping 2022 study interval, start from first day of sleep data
 - [x] Remove cycles with 4 consecutive days of hormone data missing or more than 40% of hormone data missing
