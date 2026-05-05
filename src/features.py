@@ -55,8 +55,78 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
 
     cycle_lengths = df.groupby(["id", "cycle_id"])["cycle_day"].max().rename("cycle_total_days")
     df = df.merge(cycle_lengths, on=["id", "cycle_id"])
-    df["cycle_pct"] = df["cycle_day"] / df["cycle_total_days"]
+    df["cycle_pct"] = ((df["cycle_day"] / df["cycle_total_days"]) * 100).round(1)
     return df.drop(columns=["cycle_total_days"])
+
+
+def add_hormone_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["es_to_lh_ratio"] = (df["estrogen"] / df["lh"]).round(2)
+    df["estrogen_smooth"] = (
+        df.groupby(["id"])["estrogen"]
+        .transform(lambda x: x.rolling(window=5, center=True, min_periods=1).mean())
+        .round(1)
+    )
+    df["lh_smooth"] = (
+        df.groupby(["id"])["lh"]
+        .transform(lambda x: x.rolling(window=5, center=True, min_periods=1).mean())
+        .round(1)
+    )
+    return df
+
+
+def add_activity_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["active_min_total"] = (
+        df["active_min_light"] + df["active_min_moderate"] + df["active_min_high"]
+    )
+    return df
+
+
+def add_sleep_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["rem_to_total_ratio"] = (df["sleep_min_rem"] / df["sleep_min_total"]).round(2)
+    df["deep_to_total_ratio"] = (df["sleep_min_deep"] / df["sleep_min_total"]).round(2)
+    return df
+
+
+def reports_to_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    flow_scale = [
+        "Not at all",
+        "Spotting / Very Light",
+        "Light",
+        "Somewhat Light",
+        "Moderate",
+        "Somewhat Heavy",
+        "Heavy",
+        "Very Heavy",
+    ]
+    flow_map = {v: i for i, v in enumerate(flow_scale)}
+    df["flow_volume"] = df["flow_volume"].map(flow_map).astype("Int64")
+
+    report_scale = ["Not at all", "Very Low/Little", "Low", "Moderate", "High", "Very High"]
+    scale_map = {v: i for i, v in enumerate(report_scale)}
+    cols = [
+        "appetite",
+        "exerciselevel",
+        "headaches",
+        "cramps",
+        "sorebreasts",
+        "fatigue",
+        "sleepissue",
+        "moodswing",
+        "stress",
+        "foodcravings",
+        "indigestion",
+        "bloating",
+    ]
+
+    for col in cols:
+        df[col] = df[col].map(scale_map).astype("Int64")
+
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +144,33 @@ def main(
     logger.info("Starting feature engineering...")
 
     interday = pd.read_csv(interday_input)
-    intraday = pd.read_csv(intraday_input)
+    intraday = pd.read_csv(intraday_input, parse_dates=["datetime"])
 
-    logger.info("Adding cycle features to interday...")
+    logger.info("Adding features to interday...")
     interday = add_cycle_features(interday)
+    interday = add_hormone_features(interday)
+    interday = add_activity_features(interday)
+    interday = add_sleep_features(interday)
+    interday = reports_to_numeric(interday)
 
-    interday_output.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Adding features to intraday...")
+    intraday = pd.merge(
+        intraday,
+        interday[["id", "day_in_study", "phase", "cycle_id", "cycle_day", "cycle_pct"]],
+        on=["id", "day_in_study"],
+    )
+
+    time_bins = [0, 6, 12, 18, 21, 24]
+    # pd.cut requires unique labels per bin; "night2" covers 21-24 and is collapsed after
+    time_labels = ["night", "morning", "afternoon", "evening", "night2"]
+    intraday["time_of_day"] = pd.cut(
+        intraday["datetime"].dt.hour, bins=time_bins, labels=time_labels, right=False
+    )
+    intraday["time_of_day"] = intraday["time_of_day"].replace("night2", "night")
+
     interday.to_csv(interday_output, index=False)
     logger.success(f"Saved features_interday: {interday_output} ({len(interday):,} rows)")
 
-    intraday_output.parent.mkdir(parents=True, exist_ok=True)
     intraday.to_csv(intraday_output, index=False)
     logger.success(f"Saved features_intraday: {intraday_output} ({len(intraday):,} rows)")
 

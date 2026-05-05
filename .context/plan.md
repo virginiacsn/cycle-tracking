@@ -33,18 +33,18 @@ Interday and intraday features:
 
 Interday features:
 
-- [ ] Estrogen-to-lh ratio
+- [x] Estrogen-to-lh ratio
 - [ ] LH deviation from baseline (5-day average, 5 days before LH surge)
-- [ ] Total active minutes
-- [ ] Sleep efficiency ratios - deep/total and rem/total
-- [ ] Convert reports to numeric values following Likert-type scale (0-5)
+- [x] Total active minutes
+- [x] Sleep efficiency ratios - deep/total and rem/total
+- [x] Convert reports to numeric values following Likert-type scale (0-5)
 
 Intraday features:
 
-- [ ] Time of day - morning/afternoon/evening/night
-- [ ] Add cycle phase labels from interday dataset
+- [x] Time of day - morning/afternoon/evening/night
+- [x] Add cycle phase labels from interday dataset
 
-- [ ] Implement feature engineering in `src/features.py`
+- [x] Implement feature engineering in `src/features.py`
 
 ### Phase 3: Modeling
 
