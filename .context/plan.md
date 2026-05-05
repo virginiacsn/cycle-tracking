@@ -29,7 +29,7 @@
 
 Interday and intraday features:
 
-- [ ] Cycle count, cycle day count and % of cycle progress
+- [x] Cycle count, cycle day count and % of cycle progress
 
 Interday features:
 
