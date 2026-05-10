@@ -19,6 +19,7 @@ SLOTS_PER_DAY = int(24 * 60 / RESAMPLE_MINUTES)  # 288
 MAX_CONSEC_HORMONE_MISSING = 4
 MAX_FRACTION_HORMONE_MISSING = 0.40
 MIN_DAYS_PER_SUBJECT = 30
+MIN_CYCLE_DAYS = 7
 
 # Intraday files and the value columns to keep from each
 INTRADAY_FILES: dict[str, tuple[str, ...]] = {
@@ -100,7 +101,7 @@ def _identify_cycles(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_hormone_cycles(df: pd.DataFrame) -> tuple[pd.DataFrame, set[tuple[int, int]]]:
-    """Remove cycles with >= 4 consecutive missing hormone days or > 40% missing.
+    """Remove cycles with >= 4 consecutive missing hormone days, > 40% missing, or < 7 days.
 
     Returns the filtered df and the set of valid (id, day_in_study) pairs.
     """
@@ -109,6 +110,9 @@ def filter_hormone_cycles(df: pd.DataFrame) -> tuple[pd.DataFrame, set[tuple[int
 
     bad: set[tuple] = set()
     for (sid, cid), grp in df.groupby(["id", "cycle_id"]):
+        if len(grp) < MIN_CYCLE_DAYS:
+            bad.add((sid, cid))
+            continue
         missing = grp["_missing"].values
         n = len(missing)
         if missing.sum() / n > MAX_FRACTION_HORMONE_MISSING:
@@ -123,7 +127,9 @@ def filter_hormone_cycles(df: pd.DataFrame) -> tuple[pd.DataFrame, set[tuple[int
 
     is_bad = df.apply(lambda r: (r["id"], r["cycle_id"]) in bad, axis=1)
     df_filtered = df[~is_bad].drop(columns=["_missing", "cycle_id"])
-    logger.info(f"Removed {len(bad)} cycles for incomplete hormone data")
+    logger.info(
+        f"Removed {len(bad)} cycles for incomplete hormone data or < {MIN_CYCLE_DAYS} days"
+    )
 
     valid_days: set[tuple[int, int]] = set(zip(df_filtered["id"], df_filtered["day_in_study"]))
     return df_filtered, valid_days
@@ -421,6 +427,11 @@ def main() -> None:
     intraday_path = PROCESSED_DATA_DIR / "intraday.csv"
     intraday.to_csv(intraday_path, index=False)
     logger.success(f"Saved intraday: {intraday_path} ({len(intraday):,} rows)")
+
+    cycles_df = _identify_cycles(interday)
+    n_subjects = interday["id"].nunique()
+    n_cycles = cycles_df[cycles_df["cycle_id"] > 0].groupby("id")["cycle_id"].nunique().sum()
+    logger.success(f"Dataset summary: {n_subjects} subjects, {n_cycles} cycles")
 
 
 if __name__ == "__main__":

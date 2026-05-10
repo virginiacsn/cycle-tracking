@@ -56,6 +56,36 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
     cycle_lengths = df.groupby(["id", "cycle_id"])["cycle_day"].max().rename("cycle_total_days")
     df = df.merge(cycle_lengths, on=["id", "cycle_id"])
     df["cycle_pct"] = ((df["cycle_day"] / df["cycle_total_days"]) * 100).round(1)
+
+    all_phases = {"Menstrual", "Follicular", "Fertility", "Luteal"}
+    real = df[df["cycle_id"] > 0]
+    cycles_per_subject = real.groupby("id")["cycle_id"].apply(set)
+
+    complete_set: set[tuple] = set()
+    for (sid, cid), grp in real.groupby(["id", "cycle_id"]):
+        if not all_phases.issubset(set(grp["phase"].dropna())):
+            continue
+        sid_cycles = cycles_per_subject[sid]
+        has_prev = (cid - 1) in sid_cycles
+        has_next = (cid + 1) in sid_cycles
+        ordered = grp.sort_values("day_in_study")
+        if has_prev and has_next:
+            complete_set.add((sid, cid))
+        elif not has_prev and has_next:
+            if (
+                ordered["phase"].iloc[0] == "Menstrual"
+                and (grp["phase"] == "Menstrual").sum() >= 2
+            ):
+                complete_set.add((sid, cid))
+        elif has_prev and not has_next:
+            if ordered["phase"].iloc[-1] == "Luteal" and (grp["phase"] == "Luteal").sum() >= 2:
+                complete_set.add((sid, cid))
+
+    complete = pd.DataFrame(list(complete_set), columns=["id", "cycle_id"]).assign(
+        is_complete_cycle=True
+    )
+    df = df.merge(complete, on=["id", "cycle_id"], how="left")
+    df["is_complete_cycle"] = df["is_complete_cycle"].fillna(False)
     return df.drop(columns=["cycle_total_days"])
 
 
