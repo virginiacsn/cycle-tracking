@@ -164,20 +164,24 @@ def _load_sleep() -> pd.DataFrame:
     keep = [
         "id",
         "sleep_start_day_in_study",
+        "minutestofallasleep",
         "minutesasleep",
         "minutes_deep",
         "minutes_light",
         "minutes_rem",
         "minutes_wake",
+        "efficiency",
     ]
     df = df[keep].rename(
         columns={
             "sleep_start_day_in_study": "day_in_study",
+            "minutestofallasleep": "sleep_onset_latency",
             "minutesasleep": "sleep_min_total",
             "minutes_deep": "sleep_min_deep",
             "minutes_light": "sleep_min_light",
             "minutes_rem": "sleep_min_rem",
             "minutes_wake": "sleep_min_wake",
+            "efficiency": "sleep_efficiency",
         }
     )
     stage_cols = ["sleep_min_deep", "sleep_min_light", "sleep_min_rem", "sleep_min_wake"]

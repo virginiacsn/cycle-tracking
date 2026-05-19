@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from loguru import logger
+import numpy as np
 import pandas as pd
 import typer
 
@@ -31,6 +32,14 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
     Rows before the first Menstrual phase get cycle_id=0.
     """
     df = df.copy().sort_values(["id", "day_in_study"]).reset_index(drop=True)
+
+    conditions = [
+        df["phase"] == "Mentrual",
+        df["phase"] == "Fertility",
+    ]
+    choices = ["Follicular", "Luteal"]
+
+    df["phase_dual"] = np.select(conditions, choices, default=df["phase"])
 
     for sid, grp in df.groupby("id", sort=True):
         cycle = 0
@@ -115,8 +124,17 @@ def add_activity_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_sleep_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df["light_to_total_ratio"] = (df["sleep_min_light"] / df["sleep_min_total"]).round(2)
     df["rem_to_total_ratio"] = (df["sleep_min_rem"] / df["sleep_min_total"]).round(2)
     df["deep_to_total_ratio"] = (df["sleep_min_deep"] / df["sleep_min_total"]).round(2)
+    return df
+
+
+def add_temperature_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["temperature_z_scored"] = (
+        df.groupby(["id"])["temperature"].transform(lambda x: (x - x.mean()) / x.std()).round(2)
+    )
     return df
 
 
@@ -181,6 +199,7 @@ def main(
     interday = add_hormone_features(interday)
     interday = add_activity_features(interday)
     interday = add_sleep_features(interday)
+    interday = add_temperature_features(interday)
     interday = reports_to_numeric(interday)
 
     logger.info("Adding features to intraday...")
