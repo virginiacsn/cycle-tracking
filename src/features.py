@@ -38,7 +38,6 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
         df["phase"] == "Fertility",
     ]
     choices = ["Follicular", "Luteal"]
-
     df["phase_dual"] = np.select(conditions, choices, default=df["phase"])
 
     for sid, grp in df.groupby("id", sort=True):
