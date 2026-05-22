@@ -34,7 +34,7 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().sort_values(["id", "day_in_study"]).reset_index(drop=True)
 
     conditions = [
-        df["phase"] == "Mentrual",
+        df["phase"] == "Menstrual",
         df["phase"] == "Fertility",
     ]
     choices = ["Follicular", "Luteal"]
