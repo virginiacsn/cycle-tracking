@@ -64,6 +64,9 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
     cycle_lengths = df.groupby(["id", "cycle_id"])["cycle_day"].max().rename("cycle_total_days")
     df = df.merge(cycle_lengths, on=["id", "cycle_id"])
     df["cycle_pct"] = ((df["cycle_day"] / df["cycle_total_days"]) * 100).round(1)
+    df["cycle_pct_bin"] = pd.cut(
+        df["cycle_pct"], bins=range(0, 105, 5), right=False, labels=range(0, 100, 5)
+    )
 
     all_phases = {"Menstrual", "Follicular", "Fertility", "Luteal"}
     real = df[df["cycle_id"] > 0]
