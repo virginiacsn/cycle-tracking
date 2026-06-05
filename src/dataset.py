@@ -217,6 +217,17 @@ def _load_computed_temperature() -> pd.DataFrame:
     return df.drop(columns=["temperature_samples"])
 
 
+def _load_steps() -> pd.DataFrame:
+    df = pd.read_csv(RAW_DATA_DIR / "steps.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    return (
+        df.groupby(["id", "day_in_study"])["steps"]
+        .sum()
+        .reset_index()
+        .rename(columns={"steps": "steps_total"})
+    )
+
+
 def _load_hrv() -> pd.DataFrame:
     df = pd.read_csv(RAW_DATA_DIR / "heart_rate_variability_details.csv")
     df = df[df["study_interval"] == STUDY_INTERVAL].copy()
@@ -244,6 +255,7 @@ def build_interday(first_sleep_days: dict[int, int]) -> pd.DataFrame:
     sleep = _load_sleep()
     temp = _load_computed_temperature()
     hrv = _load_hrv()
+    steps = _load_steps()
 
     rhr = pd.read_csv(RAW_DATA_DIR / "resting_heart_rate.csv")
     rhr = rhr[rhr["study_interval"] == STUDY_INTERVAL][["id", "day_in_study", "value"]].rename(
@@ -263,7 +275,7 @@ def build_interday(first_sleep_days: dict[int, int]) -> pd.DataFrame:
     )
 
     interday = hormones
-    for other in [sleep, temp, hrv, rhr, active_min]:
+    for other in [sleep, temp, hrv, rhr, active_min, steps]:
         interday = interday.merge(other, on=["id", "day_in_study"], how="left")
 
     before = len(interday)
