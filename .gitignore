@@ -1,6 +1,17 @@
 # Data
 /data/
 
+# Archive (old/scratch files)
+src/archive/
+
+# Claude Code local config
+.claude/
+.context/
+
+# Models and notebooks
+/models/
+/notebooks/
+
 # Mac OS-specific storage files
 .DS_Store
 

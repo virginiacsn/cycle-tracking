@@ -6,6 +6,8 @@ name = "pypi"
 [packages]
 seaborn = "*"
 statsmodels = "*"
+xgboost = "*"
+lightgbm = "*"
 
 [dev-packages]
 

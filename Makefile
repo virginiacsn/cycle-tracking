@@ -65,6 +65,11 @@ create_environment:
 data: requirements
 	$(PYTHON_INTERPRETER) src/dataset.py
 
+## Run data quality checks
+.PHONY: qc
+qc: data
+	$(PYTHON_INTERPRETER) src/qc.py
+
 
 #################################################################################
 # Self Documenting Commands                                                     #

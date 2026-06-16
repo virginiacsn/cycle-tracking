@@ -4,7 +4,6 @@ import ast
 
 from loguru import logger
 import pandas as pd
-from tqdm import tqdm
 import typer
 
 from src.config import PROCESSED_DATA_DIR, RAW_DATA_DIR
@@ -12,27 +11,19 @@ from src.config import PROCESSED_DATA_DIR, RAW_DATA_DIR
 app = typer.Typer()
 
 STUDY_INTERVAL = 2022
-MIN_INTRADAY_HOURS = 18
-RESAMPLE_MINUTES = 5
-MIN_INTERVALS = int(MIN_INTRADAY_HOURS * 60 / RESAMPLE_MINUTES)  # 216 five-minute slots
-SLOTS_PER_DAY = int(24 * 60 / RESAMPLE_MINUTES)  # 288
-MAX_CONSEC_HORMONE_MISSING = 4
-MAX_FRACTION_HORMONE_MISSING = 0.40
-MIN_DAYS_PER_SUBJECT = 30
-MIN_CYCLE_DAYS = 7
 
-# Intraday files and the value columns to keep from each
-INTRADAY_FILES: dict[str, tuple[str, ...]] = {
-    "heart_rate": ("bpm",),
-    "glucose": ("glucose_value",),
-}
-
-MERGE_KEYS = ["id", "study_interval", "day_in_study", "datetime", "time"]
+MERGE_KEYS = ["id", "day_in_study"]
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def deduplicate_by_timestamp(df: pd.DataFrame) -> pd.DataFrame:
+    if "timestamp" in df.columns:
+        return df.drop_duplicates(subset=["id", "study_interval", "day_in_study", "timestamp"])
+    return df.drop_duplicates()
 
 
 def _make_datetime(df: pd.DataFrame) -> pd.DataFrame:
@@ -45,122 +36,225 @@ def _make_datetime(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _full_day_range(day: int) -> pd.DatetimeIndex:
-    """96 fifteen-minute slots covering calendar day `day` (1-indexed)."""
-    start = pd.Timestamp("2022-01-01") + pd.Timedelta(days=int(day) - 1)
-    return pd.date_range(start, periods=SLOTS_PER_DAY, freq=f"{RESAMPLE_MINUTES}min")
-
-
-def _resample_intraday(df: pd.DataFrame, value_cols: list[str]) -> pd.DataFrame:
-    """Resample intraday df to 15-min intervals within a full 24h grid per (id, day)."""
-    results = []
-    groups = df.groupby(["id", "study_interval", "day_in_study"])
-    for (sid, study_int, day), grp in tqdm(groups, desc="Resampling", leave=False):
-        is_weekend = grp["is_weekend"].iloc[0] if "is_weekend" in grp.columns else None
-        resampled = grp.set_index("datetime")[value_cols].resample(f"{RESAMPLE_MINUTES}min").mean()
-        resampled = resampled.reindex(_full_day_range(day))
-        resampled = resampled.reset_index().rename(columns={"index": "datetime"})
-        resampled["id"] = sid
-        resampled["study_interval"] = study_int
-        resampled["day_in_study"] = day
-        if is_weekend is not None:
-            resampled["is_weekend"] = is_weekend
-        resampled["time"] = resampled["datetime"].dt.strftime("%H:%M")
-        resampled["datetime"] = resampled["datetime"].dt.strftime("%Y-%m-%d %H:%M")
-        results.append(resampled)
-    return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
-
-
 # ---------------------------------------------------------------------------
 # Interday loaders
 # ---------------------------------------------------------------------------
 
 
-def _load_hormones() -> pd.DataFrame:
-    df = pd.read_csv(RAW_DATA_DIR / "hormones_and_selfreport.csv")
-    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
-    df = df.drop(columns=["pdg"], errors="ignore")
-    for col in ("lh", "estrogen"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.sort_values(["id", "day_in_study"]).reset_index(drop=True)
-
-
 def _identify_cycles(df: pd.DataFrame) -> pd.DataFrame:
     """Add cycle_id column; increments each time the Menstrual phase begins."""
     df = df.copy()
-    df["cycle_id"] = 0
-    for sid, grp in df.groupby("id"):
-        cycle, prev, ids = 0, None, []
-        for phase in grp["phase"]:
-            if phase == "Menstrual" and prev != "Menstrual":
-                cycle += 1
-            ids.append(cycle)
-            prev = phase
-        df.loc[grp.index, "cycle_id"] = ids
+    is_menstrual = df["phase"] == "Menstrual"
+    prev_is_menstrual = is_menstrual.groupby(df["id"]).shift(1).fillna(False).astype(bool)
+    cycle_start = is_menstrual & ~prev_is_menstrual
+    df["cycle_id"] = cycle_start.groupby(df["id"]).cumsum()
+    df["is_full_cycle"] = df.groupby(["id", "cycle_id"])["phase"].transform(
+        lambda x: {"Menstrual", "Follicular", "Fertility", "Luteal"}.issubset(x)
+    )
     return df
 
 
-def filter_hormone_cycles(df: pd.DataFrame) -> tuple[pd.DataFrame, set[tuple[int, int]]]:
-    """Remove cycles with >= 4 consecutive missing hormone days, > 40% missing, or < 7 days.
+def _load_active_minutes() -> pd.DataFrame:
+    logger.info("Processing active_minutes.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "active_minutes.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = df[["id", "day_in_study", "sedentary", "lightly", "moderately", "very"]].rename(
+        columns={
+            "sedentary": "active_min_sedentary",
+            "lightly": "active_min_light",
+            "moderately": "active_min_moderate",
+            "very": "active_min_high",
+        }
+    )
+    # Transform to numeric
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Check for implausible values
+    check = [
+        "active_min_sedentary",
+        "active_min_light",
+        "active_min_moderate",
+        "active_min_high",
+    ]
+    for col in check:
+        df.loc[(df[col] < 0), col] = pd.NA
+    return df
 
-    Returns the filtered df and the set of valid (id, day_in_study) pairs.
-    """
-    df = _identify_cycles(df)
-    df["_missing"] = df["lh"].isna() & df["estrogen"].isna()
 
-    bad: set[tuple] = set()
-    for (sid, cid), grp in df.groupby(["id", "cycle_id"]):
-        if len(grp) < MIN_CYCLE_DAYS:
-            bad.add((sid, cid))
-            continue
-        missing = grp["_missing"].values
-        n = len(missing)
-        if missing.sum() / n > MAX_FRACTION_HORMONE_MISSING:
-            bad.add((sid, cid))
-            continue
-        consec = max_consec = 0
-        for m in missing:
-            consec = consec + 1 if m else 0
-            max_consec = max(max_consec, consec)
-        if max_consec >= MAX_CONSEC_HORMONE_MISSING:
-            bad.add((sid, cid))
+def _load_computed_temperature() -> pd.DataFrame:
+    logger.info("Processing computed_temperature.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "computed_temperature.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = deduplicate_by_timestamp(df)
+    df = df[
+        [
+            "id",
+            "sleep_start_day_in_study",
+            "temperature_samples",
+            "nightly_temperature",
+        ]
+    ].rename(
+        columns={
+            "sleep_start_day_in_study": "day_in_study",
+            "nightly_temperature": "temperature",
+        }
+    )
+    # Transform to numeric
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Check for implausible values
+    df.loc[(df["temperature"] < 25) | (df["temperature"] > 45), "temperature"] = pd.NA
+    # Same-day duplicates arise from nap + overnight sessions; keep the better-sampled one
+    df = df.sort_values("temperature_samples", ascending=False).drop_duplicates(
+        subset=["id", "day_in_study"], keep="first"
+    )
+    return df.drop(columns=["temperature_samples"])
 
-    is_bad = df.apply(lambda r: (r["id"], r["cycle_id"]) in bad, axis=1)
-    df_filtered = df[~is_bad].drop(columns=["_missing", "cycle_id"])
-    logger.info(
-        f"Removed {len(bad)} cycles for incomplete hormone data or < {MIN_CYCLE_DAYS} days"
+
+def _load_exercise() -> pd.DataFrame:
+    logger.info("Processing exercise.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "exercise.csv")
+    df = (
+        df[df["study_interval"] == STUDY_INTERVAL]
+        .copy()
+        .rename(columns={"start_day_in_study": "day_in_study"})
+    )
+    deduplicate_cols = [
+        "id",
+        "study_interval",
+        "day_in_study",
+        "start_timestamp",
+        "activitytypeid",
+        "duration",
+    ]
+    df = df.drop_duplicates(subset=deduplicate_cols)
+    df["duration"] = pd.to_numeric(df["duration"], errors="coerce")
+    # Raw duration is in milliseconds; divide by 60_000 to get minutes
+    df["duration"] = df["duration"] / 60000.0
+    df.loc[(df["duration"] < 0), "duration"] = pd.NA
+    return (
+        df.groupby(["id", "day_in_study"])
+        .agg(exercise_count=("duration", "count"), exercise_min=("duration", "sum"))
+        .reset_index()
     )
 
-    valid_days: set[tuple[int, int]] = set(zip(df_filtered["id"], df_filtered["day_in_study"]))
-    return df_filtered, valid_days
+
+def _load_heart_rate() -> pd.DataFrame:
+    logger.info("Processing heart_rate.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "heart_rate.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = deduplicate_by_timestamp(df)
+    df["bpm"] = pd.to_numeric(df["bpm"], errors="coerce")
+    df.loc[(df["bpm"] < 30) | (df["bpm"] > 220), "bpm"] = pd.NA
+
+    df = _make_datetime(df)
+    # Resample to 5-min bins; non-null bin count × 5 later estimates minutes of device wear
+    df = (
+        df.set_index("datetime")
+        .groupby(["id", "day_in_study"])["bpm"]
+        .resample("5min")
+        .mean()
+        .reset_index()
+    )
+    df = (
+        df.groupby(["id", "day_in_study"])["bpm"]
+        .agg(hr="mean", wear_minutes="count")
+        .reset_index()
+    )
+    df["wear_minutes"] = df["wear_minutes"] * 5
+    return df
 
 
-def _parse_sleep_stages(row: pd.Series) -> pd.Series:
-    try:
-        lvl = ast.literal_eval(row["levels"])
-        summary = lvl.get("summary", {})
-    except (ValueError, SyntaxError):
-        summary = {}
-
-    if row["type"] == "stages":
-        return pd.Series(
-            {
-                "minutes_deep": summary.get("deep", {}).get("minutes"),
-                "minutes_light": summary.get("light", {}).get("minutes"),
-                "minutes_rem": summary.get("rem", {}).get("minutes"),
-                "minutes_wake": summary.get("wake", {}).get("minutes"),
+def _load_heart_rate_variability() -> pd.DataFrame:
+    logger.info("Processing heart_rate_variability_details.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "heart_rate_variability_details.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = deduplicate_by_timestamp(df)
+    numeric_cols = ["rmssd", "high_frequency", "low_frequency"]
+    # Transform to numeric
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Check for implausible values
+    check = ["rmssd"]
+    for col in check:
+        df.loc[(df[col] <= 0), col] = pd.NA
+    df = (
+        df.groupby(["id", "day_in_study"])
+        .agg(
+            rmssd_mean=("rmssd", "mean"),
+            rmssd_median=("rmssd", "median"),
+            hf_mean=("high_frequency", "mean"),
+            hf_median=("high_frequency", "median"),
+            lf_mean=("low_frequency", "mean"),
+            lf_median=("low_frequency", "median"),
+        )
+        .reset_index()
+        .rename(
+            columns={
+                "rmssd_mean": "hrv_rmssd_mean",
+                "rmssd_median": "hrv_rmssd_median",
+                "hf_median": "hrv_hf_median",
+                "hf_mean": "hrv_hf_mean",
+                "lf_median": "hrv_lf_median",
+                "lf_mean": "hrv_lf_mean",
             }
         )
-    return pd.Series(
-        {"minutes_deep": None, "minutes_light": None, "minutes_rem": None, "minutes_wake": None}
     )
+    return df
+
+
+def _load_hormones_and_selfreports() -> pd.DataFrame:
+    logger.info("Processing hormones_and_selfreport.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "hormones_and_selfreport.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = df.drop(columns=["study_interval", "is_weekend", "pdg"])
+    # Transform to numeric
+    for col in ["estrogen", "lh"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Check for implausible values
+    for col in ["estrogen", "lh"]:
+        df.loc[(df[col] <= 0), col] = pd.NA
+    return df
+
+
+def _load_resting_heart_rate() -> pd.DataFrame:
+    logger.info("Processing resting_heart_rate.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "resting_heart_rate.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = df[["id", "day_in_study", "value"]].rename(columns={"value": "hr_resting"})
+    df["hr_resting"] = pd.to_numeric(df["hr_resting"], errors="coerce")
+    df.loc[(df["hr_resting"] < 30) | (df["hr_resting"] > 140), "hr_resting"] = pd.NA
+    return df
 
 
 def _load_sleep() -> pd.DataFrame:
+    logger.info("Processing sleep.csv")
     df = pd.read_csv(RAW_DATA_DIR / "sleep.csv")
-    df = df[(df["study_interval"] == STUDY_INTERVAL) & (df["mainsleep"] == True)].copy()  # noqa: E712
-    stages = df.apply(_parse_sleep_stages, axis=1)
-    df = pd.concat([df.reset_index(drop=True), stages], axis=1)
+    df = df[(df["study_interval"] == STUDY_INTERVAL) & (df["mainsleep"])].copy()
+    # "stages" type has per-stage breakdown; "classic" (older devices) only records totals
+    stages_mask = df["type"] == "stages"
+
+    def _parse_summary(s):
+        try:
+            return ast.literal_eval(s).get("summary", {})
+        except (ValueError, SyntaxError):
+            return {}
+
+    summaries = df.loc[stages_mask, "levels"].map(_parse_summary)
+    stage_cols = (
+        pd.json_normalize(summaries.tolist())
+        .reindex(columns=["deep.minutes", "light.minutes", "rem.minutes", "wake.minutes"])
+        .rename(
+            columns={
+                "deep.minutes": "minutes_deep",
+                "light.minutes": "minutes_light",
+                "rem.minutes": "minutes_rem",
+                "wake.minutes": "minutes_wake",
+            }
+        )
+        .set_index(summaries.index)
+    )
+    df = df.join(stage_cols)
     keep = [
         "id",
         "sleep_start_day_in_study",
@@ -184,227 +278,80 @@ def _load_sleep() -> pd.DataFrame:
             "efficiency": "sleep_efficiency",
         }
     )
-    stage_cols = ["sleep_min_deep", "sleep_min_light", "sleep_min_rem", "sleep_min_wake"]
-    df[stage_cols] = df[stage_cols].fillna(0)
-    # Some days have two mainsleep records (nap + overnight); keep the longer one.
+    # Transform to numeric
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Check for implausible values
+    check = ["sleep_min_total", "sleep_efficiency"]
+    for col in check:
+        df.loc[(df[col] < 0), col] = pd.NA
+    # Some days have two mainsleep records (nap + overnight); keep the longer one
     return df.sort_values("sleep_min_total", ascending=False).drop_duplicates(
         subset=["id", "day_in_study"], keep="first"
     )
 
 
-def _load_computed_temperature() -> pd.DataFrame:
-    df = pd.read_csv(RAW_DATA_DIR / "computed_temperature.csv")
-    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
-    df = df[
-        [
-            "id",
-            "sleep_start_day_in_study",
-            "temperature_samples",
-            "nightly_temperature",
-            "baseline_relative_sample_sum",
-        ]
-    ].rename(
-        columns={
-            "sleep_start_day_in_study": "day_in_study",
-            "nightly_temperature": "temperature",
-            "baseline_relative_sample_sum": "temperature_dev",
-        }
-    )
-    # Same-day duplicates arise from nap + overnight sessions; keep the better-sampled one.
-    df = df.sort_values("temperature_samples", ascending=False).drop_duplicates(
-        subset=["id", "day_in_study"], keep="first"
-    )
-    return df.drop(columns=["temperature_samples"])
-
-
 def _load_steps() -> pd.DataFrame:
+    logger.info("Processing steps.csv")
     df = pd.read_csv(RAW_DATA_DIR / "steps.csv")
     df = df[df["study_interval"] == STUDY_INTERVAL].copy()
-    return (
+    df = deduplicate_by_timestamp(df)
+    df["steps"] = pd.to_numeric(df["steps"], errors="coerce")
+    # Per-interval cap
+    df.loc[(df["steps"] < 0) | (df["steps"] > 5_000), "steps"] = pd.NA
+    df = (
         df.groupby(["id", "day_in_study"])["steps"]
         .sum()
         .reset_index()
-        .rename(columns={"steps": "steps_total"})
+        .rename(columns={"steps": "step_count"})
     )
+    # Post-aggregation cap
+    df.loc[df["step_count"] > 200_000, "step_count"] = pd.NA
+    return df
 
 
-def _load_hrv() -> pd.DataFrame:
-    df = pd.read_csv(RAW_DATA_DIR / "heart_rate_variability_details.csv")
+def _load_wrist_temperature() -> pd.DataFrame:
+    logger.info("Processing wrist_temperature.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "wrist_temperature.csv")
     df = df[df["study_interval"] == STUDY_INTERVAL].copy()
-    df["rmssd"] = pd.to_numeric(df["rmssd"], errors="coerce")
-    df = df.rename(columns={"rmssd": "heart_rate_var"})
-    return (
-        df.groupby(["id", "day_in_study"])["heart_rate_var"]
-        .agg(heart_rate_var_mean="mean", heart_rate_var_min="min", heart_rate_var_max="max")
-        .reset_index()
+    df = deduplicate_by_timestamp(df)
+    df = df[["id", "day_in_study", "temperature_diff_from_baseline"]].rename(
+        columns={"temperature_diff_from_baseline": "temperature_diff"}
     )
+    # Transform to numeric
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Check for implausible values
+    df.loc[(df["temperature_diff"] < -5) | (df["temperature_diff"] > 5), "temperature_diff"] = (
+        pd.NA
+    )
+    return df.groupby(["id", "day_in_study"])["temperature_diff"].mean().reset_index()
 
 
-def _compute_first_sleep_day() -> dict[int, int]:
-    """Return {id: first sleep_start_day_in_study} as per-subject start filter."""
-    df = pd.read_csv(RAW_DATA_DIR / "sleep.csv")
-    df = df[(df["study_interval"] == STUDY_INTERVAL) & (df["mainsleep"] == True)]  # noqa: E712
-    return df.groupby("id")["sleep_start_day_in_study"].min().to_dict()
-
-
-def build_interday(first_sleep_days: dict[int, int]) -> pd.DataFrame:
+def build_interday() -> pd.DataFrame:
     """Assemble interday CSV from all interday sources."""
-    hormones_raw = _load_hormones()
-    hormones, _ = filter_hormone_cycles(hormones_raw)
-
-    sleep = _load_sleep()
+    active_min = _load_active_minutes()
     temp = _load_computed_temperature()
-    hrv = _load_hrv()
+    exercise = _load_exercise()
+    hr = _load_heart_rate()
+    hrv = _load_heart_rate_variability()
+    hormones_selfreport = _load_hormones_and_selfreports()
+    rhr = _load_resting_heart_rate()
+    sleep = _load_sleep()
     steps = _load_steps()
+    temp_diff = _load_wrist_temperature()
 
-    rhr = pd.read_csv(RAW_DATA_DIR / "resting_heart_rate.csv")
-    rhr = rhr[rhr["study_interval"] == STUDY_INTERVAL][["id", "day_in_study", "value"]].rename(
-        columns={"value": "resting_heart_rate"}
-    )
+    interday = hormones_selfreport
+    for other in [active_min, temp, exercise, hr, hrv, rhr, sleep, steps, temp_diff]:
+        interday = interday.merge(other, on=MERGE_KEYS, how="left")
 
-    active_min = pd.read_csv(RAW_DATA_DIR / "active_minutes.csv")
-    active_min = active_min[active_min["study_interval"] == STUDY_INTERVAL][
-        ["id", "day_in_study", "sedentary", "lightly", "moderately", "very"]
-    ].rename(
-        columns={
-            "sedentary": "active_min_sedentary",
-            "lightly": "active_min_light",
-            "moderately": "active_min_moderate",
-            "very": "active_min_high",
-        }
-    )
+    interday = _identify_cycles(interday)
 
-    interday = hormones
-    for other in [sleep, temp, hrv, rhr, active_min, steps]:
-        interday = interday.merge(other, on=["id", "day_in_study"], how="left")
-
-    before = len(interday)
-    min_day = interday["id"].map(first_sleep_days)
-    interday = interday[interday["day_in_study"] >= min_day].reset_index(drop=True)
-    logger.info(f"Removed {before - len(interday)} interday rows before first sleep day")
-
-    day_counts = interday.groupby("id")["day_in_study"].nunique()
-    valid_subjects = day_counts[day_counts >= MIN_DAYS_PER_SUBJECT].index
-    before = interday["id"].nunique()
-    interday = interday[interday["id"].isin(valid_subjects)].reset_index(drop=True)
-    logger.info(
-        f"Removed {before - len(valid_subjects)} subjects with < {MIN_DAYS_PER_SUBJECT} days"
-    )
-
-    first_cols = ["id", "day_in_study", "is_weekend"]
-    rest = [c for c in interday.columns if c not in first_cols + ["study_interval"]]
+    first_cols = ["id", "day_in_study"]
+    rest = [c for c in interday.columns if c not in first_cols + ["cycle_id", "is_full_cycle"]]
+    rest.insert(rest.index("phase") + 1, "cycle_id")
+    rest.insert(rest.index("cycle_id") + 1, "is_full_cycle")
     return interday[first_cols + rest]
-
-
-# ---------------------------------------------------------------------------
-# Intraday loaders
-# ---------------------------------------------------------------------------
-
-
-def _load_intraday_file(name: str, value_cols: tuple[str, ...]) -> pd.DataFrame:
-    path = RAW_DATA_DIR / f"{name}.csv"
-    logger.info(f"Loading {name}...")
-    df = pd.read_csv(path)
-    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
-    cols = ["id", "study_interval", "day_in_study", "is_weekend", "timestamp"] + list(value_cols)
-    return _make_datetime(df[cols])
-
-
-def _load_active_zone_minutes() -> pd.DataFrame:
-    logger.info("Loading active_zone_minutes...")
-    df = pd.read_csv(RAW_DATA_DIR / "active_zone_minutes.csv")
-    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
-    df = _make_datetime(df)
-    pivoted = df.pivot_table(
-        index=["id", "study_interval", "day_in_study", "datetime"],
-        columns="heart_zone_id",
-        values="total_minutes",
-        aggfunc="sum",
-    ).reset_index()
-    pivoted.columns.name = None
-    for zone, col in [
-        ("CARDIO", "azm_cardio"),
-        ("FAT_BURN", "azm_fat_burn"),
-        ("PEAK", "azm_peak"),
-    ]:
-        if zone in pivoted.columns:
-            pivoted = pivoted.rename(columns={zone: col})
-        else:
-            pivoted[col] = float("nan")
-    return pivoted
-
-
-def _filter_to_valid_days(df: pd.DataFrame, valid_days: set[tuple[int, int]]) -> pd.DataFrame:
-    mask = pd.Series(list(zip(df["id"], df["day_in_study"])), index=df.index).isin(valid_days)
-    return df[mask]
-
-
-def build_intraday(
-    valid_days: set[tuple[int, int]], first_sleep_days: dict[int, int]
-) -> pd.DataFrame:
-    """Load, filter, resample, merge, and interpolate all intraday sources."""
-    sleep_filtered = {(sid, day) for sid, day in valid_days if day >= first_sleep_days.get(sid, 0)}
-    n_pre_sleep = len(valid_days) - len(sleep_filtered)
-    if n_pre_sleep:
-        logger.info(f"Filtered {n_pre_sleep} subject-days before first sleep day from intraday")
-    valid_days = sleep_filtered
-
-    parts: dict[str, tuple[pd.DataFrame, list[str]]] = {}
-
-    for name, value_cols in INTRADAY_FILES.items():
-        df = _load_intraday_file(name, value_cols)
-        df = _filter_to_valid_days(df, valid_days)
-        df = _resample_intraday(df, list(value_cols))
-        parts[name] = (df, list(value_cols))
-
-    azm_df = _load_active_zone_minutes()
-    azm_df = _filter_to_valid_days(azm_df, valid_days)
-    azm_cols = [c for c in azm_df.columns if c.startswith("azm_")]
-    azm_df = _resample_intraday(azm_df, azm_cols)
-    parts["active_zone_minutes"] = (azm_df, azm_cols)
-
-    # Merge all sources on MERGE_KEYS; heart_rate is the base
-    merged, _ = parts["heart_rate"]
-    for name, (df, _) in parts.items():
-        if name == "heart_rate":
-            continue
-        val_cols = [c for c in df.columns if c not in MERGE_KEYS and c != "is_weekend"]
-        merged = merged.merge(df[MERGE_KEYS + val_cols], on=MERGE_KEYS, how="outer")
-
-    # Filter days with < 18h intraday coverage (bpm as reference signal)
-    coverage = merged.groupby(["id", "day_in_study"])["bpm"].count()
-    valid_cov = coverage[coverage >= MIN_INTERVALS].reset_index()[["id", "day_in_study"]]
-    before = merged[["id", "day_in_study"]].drop_duplicates().shape[0]
-    merged = merged.merge(valid_cov, on=["id", "day_in_study"])
-    after = merged[["id", "day_in_study"]].drop_duplicates().shape[0]
-    logger.info(
-        f"Removed {before - after} subject-days for < {MIN_INTRADAY_HOURS}h intraday coverage"
-    )
-
-    interp_cols = [c for c in merged.columns if c in ("bpm", "glucose_value")]
-    zero_fill_cols = [c for c in merged.columns if c.startswith("azm_")]
-    interpolated = []
-    for (sid, day), grp in tqdm(
-        merged.groupby(["id", "day_in_study"]), desc="Interpolating", leave=False
-    ):
-        grp = grp.sort_values("datetime").copy()
-        grp[interp_cols] = grp[interp_cols].interpolate(method="linear")
-        grp[zero_fill_cols] = grp[zero_fill_cols].fillna(0)
-        interpolated.append(grp)
-
-    result = pd.concat(interpolated, ignore_index=True)
-
-    input_subjects = {sid for sid, _ in valid_days}
-    day_counts = result.groupby("id")["day_in_study"].nunique()
-    valid_subjects = day_counts[day_counts >= MIN_DAYS_PER_SUBJECT].index
-    result = result[result["id"].isin(valid_subjects)].reset_index(drop=True)
-    logger.info(
-        f"Removed {len(input_subjects) - len(valid_subjects)} subjects with < {MIN_DAYS_PER_SUBJECT} intraday days (coverage filter)"
-    )
-
-    first_cols = ["id", "day_in_study", "is_weekend", "datetime", "time"]
-    rest = [c for c in result.columns if c not in first_cols + ["study_interval"]]
-    return result[first_cols + rest]
 
 
 # ---------------------------------------------------------------------------
@@ -418,36 +365,16 @@ def main() -> None:
 
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    first_sleep_days = _compute_first_sleep_day()
-
     logger.info("Processing interday data...")
-    hormones_raw = _load_hormones()
-    _, valid_days = filter_hormone_cycles(hormones_raw)
-    interday = build_interday(first_sleep_days)
-
-    logger.info("Processing intraday data...")
-    valid_subjects = set(interday["id"].unique())
-    valid_days = {(sid, day) for sid, day in valid_days if sid in valid_subjects}
-    intraday = build_intraday(valid_days, first_sleep_days)
-
-    final_subjects = set(intraday["id"].unique())
-    if final_subjects != valid_subjects:
-        dropped = len(valid_subjects) - len(final_subjects)
-        logger.info(f"Dropping {dropped} subjects from interday lost in intraday coverage filter")
-        interday = interday[interday["id"].isin(final_subjects)].reset_index(drop=True)
+    interday = build_interday()
 
     interday_path = PROCESSED_DATA_DIR / "interday.csv"
     interday.to_csv(interday_path, index=False)
     logger.success(f"Saved interday: {interday_path} ({len(interday):,} rows)")
 
-    intraday_path = PROCESSED_DATA_DIR / "intraday.csv"
-    intraday.to_csv(intraday_path, index=False)
-    logger.success(f"Saved intraday: {intraday_path} ({len(intraday):,} rows)")
-
-    cycles_df = _identify_cycles(interday)
     n_subjects = interday["id"].nunique()
-    n_cycles = cycles_df[cycles_df["cycle_id"] > 0].groupby("id")["cycle_id"].nunique().sum()
-    logger.success(f"Dataset summary: {n_subjects} subjects, {n_cycles} cycles")
+    n_cycles = interday[interday["is_full_cycle"]].groupby("id")["cycle_id"].nunique().sum()
+    logger.success(f"Dataset summary: {n_subjects} subjects, {n_cycles} full cycles")
 
 
 if __name__ == "__main__":

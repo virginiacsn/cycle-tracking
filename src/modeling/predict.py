@@ -1,28 +1,41 @@
+"""Inference: predict cycle phase using a trained classification model."""
+
 from pathlib import Path
 
-from cycle_tracking.config import MODELS_DIR, PROCESSED_DATA_DIR
+import joblib
 from loguru import logger
-from tqdm import tqdm
+import pandas as pd
 import typer
 
+from src.config import MODELS_DIR, PROCESSED_DATA_DIR
+
 app = typer.Typer()
+
+DEFAULT_MODEL = MODELS_DIR / "obj1_fitbit_random_forest.pkl"
+DEFAULT_FEATURES = PROCESSED_DATA_DIR / "interday_fitbit.csv"
+DEFAULT_OUTPUT = PROCESSED_DATA_DIR / "predictions.csv"
 
 
 @app.command()
 def main(
-    # ---- REPLACE DEFAULT PATHS AS APPROPRIATE ----
-    features_path: Path = PROCESSED_DATA_DIR / "test_features.csv",
-    model_path: Path = MODELS_DIR / "model.pkl",
-    predictions_path: Path = PROCESSED_DATA_DIR / "test_predictions.csv",
-    # -----------------------------------------
-):
-    # ---- REPLACE THIS WITH YOUR OWN CODE ----
-    logger.info("Performing inference for model...")
-    for i in tqdm(range(10), total=10):
-        if i == 5:
-            logger.info("Something happened for iteration 5.")
-    logger.success("Inference complete.")
-    # -----------------------------------------
+    features_path: Path = DEFAULT_FEATURES,
+    model_path: Path = DEFAULT_MODEL,
+    output_path: Path = DEFAULT_OUTPUT,
+) -> None:
+    if not model_path.exists():
+        logger.error(f"Model not found: {model_path}. Run train.py first.")
+        raise typer.Exit(1)
+
+    model = joblib.load(model_path)
+    feature_names = list(model.feature_names_in_)
+
+    df = pd.read_csv(features_path)
+    X = df[feature_names].astype(float)
+
+    df["predicted_phase"] = model.predict(X)
+    out_cols = ["id", "day_in_study", "phase", "predicted_phase"]
+    df[out_cols].to_csv(output_path, index=False)
+    logger.success(f"Predictions saved to {output_path} ({len(df):,} rows)")
 
 
 if __name__ == "__main__":
