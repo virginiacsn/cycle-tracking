@@ -7,6 +7,7 @@ src/archive/
 # Claude Code local config
 .claude/
 .context/
+.rules/
 
 # Models and notebooks
 /models/

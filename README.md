@@ -34,11 +34,12 @@ make data
 ├── models/                <- Serialized models
 └── src/
     ├── config.py          <- Paths, env vars, logger
-    ├── dataset.py         <- Raw → processed pipeline (Typer CLI)
-    ├── features.py        <- Feature engineering
+    ├── dataset.py         <- Raw → interday.csv (load, merge, clean)
+    ├── qc.py              <- interday.csv → interday_qc.csv (wear time + day filters)
+    ├── features.py        <- interday_qc.csv → interday_fitbit.csv + interday_selfreports.csv
     ├── plots.py           <- Visualizations
     └── modeling/
-        ├── train.py       <- Model training
+        ├── train.py       <- GroupKFold CV training (logreg, RF, XGBoost, LightGBM)
         └── predict.py     <- Inference
 ```
 
@@ -51,11 +52,14 @@ ruff check --fix . && ruff format .
 # Tests
 pipenv run pytest tests/ --cov
 
-# Data pipeline step
+# Run individual pipeline steps
 pipenv run python src/dataset.py
+pipenv run python src/qc.py
+pipenv run python src/features.py
+pipenv run python src/modeling/train.py
 ```
 
-See `.context/plan.md` for current task status and `.rules/` for coding standards.
+See `.rules/` for coding standards.
 
 ## Dataset
 
