@@ -111,6 +111,18 @@ def _load_computed_temperature() -> pd.DataFrame:
     return df.drop(columns=["temperature_samples"])
 
 
+def _load_demographic_vo2_max() -> pd.DataFrame:
+    logger.info("Processing demographic_vo2_max.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "demographic_vo2_max.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = df[["id", "day_in_study", "demographic_vo2_max"]].rename(
+        columns={"demographic_vo2_max": "vo2_max"}
+    )
+    df["vo2_max"] = pd.to_numeric(df["vo2_max"], errors="coerce")
+    df.loc[(df["vo2_max"] < 10) | (df["vo2_max"] > 80), "vo2_max"] = pd.NA
+    return df
+
+
 def _load_exercise() -> pd.DataFrame:
     logger.info("Processing exercise.csv")
     df = pd.read_csv(RAW_DATA_DIR / "exercise.csv")
@@ -214,6 +226,21 @@ def _load_hormones_and_selfreports() -> pd.DataFrame:
     # Check for implausible values
     for col in ["estrogen", "lh"]:
         df.loc[(df[col] <= 0), col] = pd.NA
+    return df
+
+
+def _load_respiratory_rate() -> pd.DataFrame:
+    logger.info("Processing respiratory_rate_summary.csv")
+    df = pd.read_csv(RAW_DATA_DIR / "respiratory_rate_summary.csv")
+    df = df[df["study_interval"] == STUDY_INTERVAL].copy()
+    df = deduplicate_by_timestamp(df)
+    df = df[["id", "day_in_study", "full_sleep_breathing_rate"]].rename(
+        columns={"full_sleep_breathing_rate": "respiratory_rate"}
+    )
+    df["respiratory_rate"] = pd.to_numeric(df["respiratory_rate"], errors="coerce")
+    df.loc[(df["respiratory_rate"] < 4) | (df["respiratory_rate"] > 30), "respiratory_rate"] = (
+        pd.NA
+    )
     return df
 
 
@@ -332,17 +359,31 @@ def build_interday() -> pd.DataFrame:
     """Assemble interday CSV from all interday sources."""
     active_min = _load_active_minutes()
     temp = _load_computed_temperature()
+    vo2_max = _load_demographic_vo2_max()
     exercise = _load_exercise()
     hr = _load_heart_rate()
     hrv = _load_heart_rate_variability()
     hormones_selfreport = _load_hormones_and_selfreports()
     rhr = _load_resting_heart_rate()
+    resp = _load_respiratory_rate()
     sleep = _load_sleep()
     steps = _load_steps()
     temp_diff = _load_wrist_temperature()
 
     interday = hormones_selfreport
-    for other in [active_min, temp, exercise, hr, hrv, rhr, sleep, steps, temp_diff]:
+    for other in [
+        active_min,
+        temp,
+        vo2_max,
+        exercise,
+        hr,
+        hrv,
+        rhr,
+        resp,
+        sleep,
+        steps,
+        temp_diff,
+    ]:
         interday = interday.merge(other, on=MERGE_KEYS, how="left")
 
     interday = _identify_cycles(interday)

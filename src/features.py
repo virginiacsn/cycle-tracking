@@ -29,7 +29,6 @@ WEARABLE_FEATURES = [
     "active_min_light",
     "active_min_moderate",
     "active_min_high",
-    # "temperature",
     # "exercise_count",
     # "exercise_min",
     "hr",
@@ -49,7 +48,10 @@ WEARABLE_FEATURES = [
     # "sleep_min_wake",
     "sleep_efficiency",
     "step_count",
+    # "temperature",
     "temperature_diff",
+    "respiratory_rate",
+    "vo2_max",
 ]
 
 SELFREPORT_FEATURES = [

@@ -73,7 +73,6 @@ def _check_missingness(df: pd.DataFrame) -> int:
 def _plot_numeric_distributions(df: pd.DataFrame, output_path: Path):
     n_cols = 4
     n_rows = int(np.ceil(len(df.columns) / n_cols))
-
     _, ax = plt.subplots(n_rows, n_cols, figsize=(15, 18), sharey=False)
     for i, col in enumerate(df.columns):
         r, c = i // n_cols, i % n_cols
@@ -90,10 +89,30 @@ def _plot_numeric_distributions(df: pd.DataFrame, output_path: Path):
             ax[r, c].set_ylabel("Counts")
         for axs in ax.flatten()[len(df.columns) :]:
             axs.set_visible(False)
-
     plt.tight_layout()
     if output_path:
-        plt.savefig(output_path / "qc_distributions.pdf")
+        plt.savefig(output_path / "qc_distributions.png", dpi=150)
+    plt.close()
+
+
+def _plot_numeric_correlations(df: pd.DataFrame, output_path: Path):
+    corr = df.corr()
+    n = len(corr)
+    _, ax = plt.subplots(figsize=(11, 10))
+    cmap = mcolors.LinearSegmentedColormap.from_list("", ["orange", "white", "purple"])
+    im = ax.imshow(corr.values, vmin=-1, vmax=1, cmap=cmap, aspect="auto")
+    cb = plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+    cb.outline.set_visible(False)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(corr.columns, rotation=90, fontsize=10)
+    ax.set_yticklabels(corr.columns, fontsize=10)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path / "qc_correlations.png", dpi=150)
+    plt.close()
 
 
 def _check_distributions(df: pd.DataFrame) -> int:
@@ -104,6 +123,7 @@ def _check_distributions(df: pd.DataFrame) -> int:
     logger.info(f"Percentiles (p05 / p25 / p50 / p75 / p95):\n{pct.T.to_string()}")
 
     _plot_numeric_distributions(numeric, FIGURES_DIR)
+    _plot_numeric_correlations(numeric, FIGURES_DIR)
 
     issues = 0
     for col, (lo, hi) in MEDIAN_RANGES.items():
