@@ -62,11 +62,17 @@ def _filter_min_days(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _check_missingness(df: pd.DataFrame) -> int:
+    counts = df.isnull().sum()
     rates = df.isnull().mean().sort_values(ascending=False)
-    logger.info(f"Null rates (columns with any missing):\n{rates[rates > 0].to_string()}")
+    has_missing = rates[rates > 0]
+    if len(has_missing):
+        lines = "\n".join(
+            f"  {col}: {counts[col]} ({rates[col]:.1%})" for col in has_missing.index
+        )
+        logger.info(f"Null counts (columns with any missing):\n{lines}")
     flagged = rates[rates > MISSINGNESS_WARN_THRESHOLD]
     for col, rate in flagged.items():
-        logger.warning(f"High missingness: {col} is {rate:.1%} null")
+        logger.warning(f"High missingness: {col} is {counts[col]} ({rate:.1%}) null")
     return len(flagged)
 
 
@@ -123,7 +129,6 @@ def _check_distributions(df: pd.DataFrame) -> int:
     logger.info(f"Percentiles (p05 / p25 / p50 / p75 / p95):\n{pct.T.to_string()}")
 
     _plot_numeric_distributions(numeric, FIGURES_DIR)
-    _plot_numeric_correlations(numeric, FIGURES_DIR)
 
     issues = 0
     for col, (lo, hi) in MEDIAN_RANGES.items():
@@ -133,6 +138,51 @@ def _check_distributions(df: pd.DataFrame) -> int:
         if not (lo <= median <= hi):
             logger.warning(f"{col}: median {median:.2f} outside expected [{lo}, {hi}]")
             issues += 1
+    return issues
+
+
+def _check_outliers(df: pd.DataFrame) -> int:
+    numeric = df.select_dtypes("number").drop(
+        columns=["id", "day_in_study", "cycle_id", "wear_minutes"], errors="ignore"
+    )
+    counts = {}
+    for col in numeric.columns:
+        series = numeric[col].dropna()
+        q1, q3 = series.quantile(0.25), series.quantile(0.75)
+        iqr = q3 - q1
+        n_out = int(((series < q1 - 1.5 * iqr) | (series > q3 + 1.5 * iqr)).sum())
+        if n_out:
+            counts[col] = (n_out, n_out / len(series))
+    if counts:
+        lines = "\n".join(
+            f"  {col}: {n} ({p:.1%})"
+            for col, (n, p) in sorted(counts.items(), key=lambda x: -x[1][0])
+        )
+        logger.info(f"Outlier counts (global IQR x 1.5):\n{lines}")
+    else:
+        logger.info("No outliers detected")
+    return 0
+
+
+def _check_correlations(df: pd.DataFrame) -> int:
+    numeric = df.select_dtypes("number").drop(
+        columns=["id", "day_in_study", "cycle_id", "wear_minutes"], errors="ignore"
+    )
+
+    _plot_numeric_correlations(numeric, FIGURES_DIR)
+
+    corr = numeric.corr().abs()
+    mask = np.triu(np.ones(corr.shape), k=1).astype(bool)
+    corr = corr.where(mask).stack().rename("cc").reset_index()
+
+    pairs = corr[corr["cc"] >= 0.9].copy()
+    issues = 0
+    if len(pairs):
+        logger.warning(f"High collinearity — {len(pairs)} pair(s) with |r| >= 0.9")
+        logger.info(f"Collinear pairs:\n{pairs.to_string(index=False)}")
+        issues += 1
+    else:
+        logger.info("No pairs with |r| >= 0.9")
     return issues
 
 
@@ -198,6 +248,8 @@ def main() -> None:
     issues = 0
     issues += _check_missingness(df)
     issues += _check_distributions(df)
+    issues += _check_outliers(df)
+    issues += _check_correlations(df)
     issues += _check_coverage(df)
 
     out_path = PROCESSED_DATA_DIR / "interday_qc.csv"
