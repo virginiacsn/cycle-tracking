@@ -34,10 +34,10 @@ WEARABLE_FEATURES = [
     "hr",
     # "wear_minutes",
     "hrv_rmssd_mean",
-    "hrv_rmssd_median",
-    # "hrv_hf_mean",
+    # "hrv_rmssd_median",
+    "hrv_hf_mean",
     # "hrv_hf_median",
-    # "hrv_lf_mean",
+    "hrv_lf_mean",
     # "hrv_lf_median",
     "hr_resting",
     # "sleep_onset_latency",
@@ -130,6 +130,12 @@ def reports_to_numeric(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def impute_ffill(df: pd.DataFrame, cols: list, limit: int) -> pd.DataFrame:
+    df = df.sort_values(["id", "day_in_study"])
+    df[cols] = df.groupby("id")[cols].ffill(limit=limit)
+    return df
+
+
 def add_rolling_features(df: pd.DataFrame, cols: list, lags: list) -> pd.DataFrame:
     new_cols = {}
     for lag in lags:
@@ -137,10 +143,10 @@ def add_rolling_features(df: pd.DataFrame, cols: list, lags: list) -> pd.DataFra
             if col in df.columns:
                 grouped = df.groupby("id")[col]
                 new_cols[col + "_rm_" + str(lag)] = grouped.transform(
-                    lambda x, w=lag: x.rolling(window=w).mean()
+                    lambda x, w=lag: x.rolling(window=w, min_periods=1).mean()
                 )
                 new_cols[col + "_rs_" + str(lag)] = grouped.transform(
-                    lambda x, w=lag: x.rolling(window=w).std()
+                    lambda x, w=lag: x.rolling(window=w, min_periods=1).std()
                 )
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
@@ -164,11 +170,13 @@ def main(
     df = add_cycle_features(df)
 
     fitbit = df[SHARED_FEATURES + WEARABLE_FEATURES].copy()
-    fitbit = add_rolling_features(fitbit, WEARABLE_FEATURES, lags=[5, 7, 14])
+    fitbit = impute_ffill(fitbit, WEARABLE_FEATURES, 3)
+    fitbit = add_rolling_features(fitbit, WEARABLE_FEATURES, lags=[7, 14])
 
     selfreports = df[SHARED_FEATURES + SELFREPORT_FEATURES].copy()
     selfreports = reports_to_numeric(selfreports)
-    selfreports = add_rolling_features(selfreports, SELFREPORT_FEATURES, lags=[5, 7, 14])
+    selfreports = impute_ffill(selfreports, SELFREPORT_FEATURES, 1)
+    selfreports = add_rolling_features(selfreports, SELFREPORT_FEATURES, lags=[7, 14])
 
     output_fitbit.parent.mkdir(parents=True, exist_ok=True)
     fitbit.to_csv(output_fitbit, index=False)
