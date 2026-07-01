@@ -39,7 +39,11 @@ MEDIAN_RANGES = {
 
 def _filter_wear_time(df: pd.DataFrame) -> pd.DataFrame:
     before = len(df)
-    df["wear_valid"] = df["wear_minutes"] >= (MIN_DAILY_WEAR_TIME * 60)
+    best_wear = df[["wear_min", "wear_min_active"]].max(axis=1)
+    df["wear_valid"] = best_wear >= (MIN_DAILY_WEAR_TIME * 60)
+    corrupt_ids = ~df.groupby("id")["wear_valid"].any()
+    for cid in corrupt_ids[corrupt_ids].index:
+        df.loc[df["id"] == cid, "wear_valid"] = df.loc[df["id"] == cid, "hr_resting"].any()
     df = df[df["wear_valid"].fillna(False)].drop(columns=["wear_valid"])
     logger.info(f"Wear time filter: removed {before - len(df)} days below {MIN_DAILY_WEAR_TIME}h")
     return df.reset_index(drop=True)
@@ -123,7 +127,7 @@ def _plot_numeric_correlations(df: pd.DataFrame, output_path: Path):
 
 def _check_distributions(df: pd.DataFrame) -> int:
     numeric = df.select_dtypes("number").drop(
-        columns=["id", "day_in_study", "cycle_id", "wear_minutes"], errors="ignore"
+        columns=["id", "day_in_study", "cycle_id", "wear_min", "wear_min_active"], errors="ignore"
     )
     pct = numeric.quantile([0.05, 0.25, 0.5, 0.75, 0.95]).round(2)
     logger.info(f"Percentiles (p05 / p25 / p50 / p75 / p95):\n{pct.T.to_string()}")
@@ -143,7 +147,7 @@ def _check_distributions(df: pd.DataFrame) -> int:
 
 def _check_outliers(df: pd.DataFrame) -> int:
     numeric = df.select_dtypes("number").drop(
-        columns=["id", "day_in_study", "cycle_id", "wear_minutes"], errors="ignore"
+        columns=["id", "day_in_study", "cycle_id", "wear_min", "wear_min_active"], errors="ignore"
     )
     counts = {}
     for col in numeric.columns:
@@ -166,7 +170,7 @@ def _check_outliers(df: pd.DataFrame) -> int:
 
 def _check_correlations(df: pd.DataFrame) -> int:
     numeric = df.select_dtypes("number").drop(
-        columns=["id", "day_in_study", "cycle_id", "wear_minutes"], errors="ignore"
+        columns=["id", "day_in_study", "cycle_id", "wear_min", "wear_min_active"], errors="ignore"
     )
 
     _plot_numeric_correlations(numeric, FIGURES_DIR)
@@ -184,6 +188,46 @@ def _check_correlations(df: pd.DataFrame) -> int:
     else:
         logger.info("No pairs with |r| >= 0.9")
     return issues
+
+
+def _check_phase_gaps(df: pd.DataFrame, threshold: int = 5) -> int:
+    report_cols = [
+        "estrogen",
+        "lh",
+        "appetite",
+        "exerciselevel",
+        "headaches",
+        "cramps",
+        "sorebreasts",
+        "fatigue",
+        "sleepissue",
+        "moodswing",
+        "stress",
+        "foodcravings",
+        "indigestion",
+        "bloating",
+        "flow_volume",
+    ]
+    data_cols = [c for c in report_cols if c in df.columns]
+    flagged = {}
+    for sid, sdf in df.groupby("id"):
+        has_data = sdf.groupby("day_in_study")[data_cols].apply(lambda x: x.notna().any().any())
+        full_range = pd.RangeIndex(has_data.index.min(), has_data.index.max() + 1)
+        no_data = ~has_data.reindex(full_range, fill_value=False)
+        run_id = (no_data != no_data.shift()).cumsum()
+        run_lengths = no_data[no_data].groupby(run_id[no_data]).count()
+        long_runs = run_lengths[run_lengths > threshold]
+        if not long_runs.empty:
+            flagged[sid] = sorted(long_runs.astype(int).tolist(), reverse=True)
+    if flagged:
+        logger.warning(
+            f"{len(flagged)} subject(s) with >{threshold} consecutive days with no self-report data"
+        )
+        lines = "\n".join(f"  id={sid}: {lengths}" for sid, lengths in flagged.items())
+        logger.info(f"Self-report gaps:\n{lines}")
+    else:
+        logger.info(f"No subjects with >{threshold} consecutive days with no data")
+    return int(bool(flagged))
 
 
 def _check_coverage(df: pd.DataFrame) -> int:
@@ -237,6 +281,8 @@ def main() -> None:
         f"{len(df):,} rows, {df.shape[1]} columns"
     )
 
+    issues = _check_phase_gaps(df)
+
     before = len(df)
     df = df.dropna(subset=["id", "day_in_study", "phase"])
     logger.info(f"Filtering for null id, day_in_study, phase: removed {before - len(df)} days")
@@ -245,7 +291,6 @@ def main() -> None:
     df = _filter_min_days(df)
     logger.info(f"After filtering: {df['id'].nunique()} subjects, {len(df):,} rows")
 
-    issues = 0
     issues += _check_missingness(df)
     issues += _check_distributions(df)
     issues += _check_outliers(df)

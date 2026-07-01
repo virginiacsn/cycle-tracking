@@ -14,12 +14,14 @@ app = typer.Typer()
 INTERDAY_INPUT = PROCESSED_DATA_DIR / "interday_qc.csv"
 OUTPUT_FITBIT = PROCESSED_DATA_DIR / "interday_fitbit.csv"
 OUTPUT_SELFREPORTS = PROCESSED_DATA_DIR / "interday_selfreports.csv"
+OUTPUT_COMBINED = PROCESSED_DATA_DIR / "interday_combined.csv"
 
 SHARED_FEATURES = [
     "id",
     "day_in_study",
     "phase",
-    "phase_id",
+    "phase_label",
+    "fertility_label",
     "cycle_id",
     "is_full_cycle",
 ]
@@ -32,7 +34,8 @@ WEARABLE_FEATURES = [
     # "exercise_count",
     # "exercise_min",
     "hr",
-    # "wear_minutes",
+    # "wear_min",
+    # "wear_min_active",
     "hrv_rmssd_mean",
     # "hrv_rmssd_median",
     "hrv_hf_mean",
@@ -48,7 +51,7 @@ WEARABLE_FEATURES = [
     # "sleep_min_wake",
     "sleep_efficiency",
     "step_count",
-    # "temperature",
+    "temperature",
     "temperature_diff",
     "respiratory_rate",
     "vo2_max",
@@ -76,27 +79,29 @@ SELFREPORT_FEATURES = [
 
 
 def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add cycle_day, cycle_pct, cycle_pct_bin, phase_dual to an interday dataframe."""
     df = df.copy().sort_values(["id", "day_in_study"]).reset_index(drop=True)
-    df["phase_id"] = pd.Categorical(
+    df["phase_label"] = pd.Categorical(
         df["phase"], categories=["Menstrual", "Follicular", "Fertility", "Luteal"]
     ).codes
 
-    conditions = [
-        df["phase"] == "Menstrual",
-        df["phase"] == "Fertility",
-    ]
-    choices = ["Follicular", "Luteal"]
-    df["phase_dual"] = np.select(conditions, choices, default=df["phase"])
+    df["fertility_label"] = (df["phase"] == "Fertility").astype("Int64")
 
-    df["cycle_day"] = df.groupby(["id", "cycle_id"]).cumcount()
-    cycle_lengths = df.groupby(["id", "cycle_id"])["cycle_day"].max().rename("cycle_total_days")
-    df = df.merge(cycle_lengths, on=["id", "cycle_id"])
-    df["cycle_pct"] = ((df["cycle_day"] / df["cycle_total_days"]) * 100).round(1)
-    df["cycle_pct_bin"] = pd.cut(
-        df["cycle_pct"], bins=range(0, 105, 5), right=False, labels=range(0, 100, 5)
-    )
-    return df.drop(columns=["cycle_total_days"])
+    # conditions = [
+    #     df["phase"] == "Menstrual",
+    #     df["phase"] == "Fertility",
+    # ]
+    # choices = ["Follicular", "Luteal"]
+    # df["phase_dual"] = np.select(conditions, choices, default=df["phase"])
+
+    # df["cycle_day"] = df.groupby(["id", "cycle_id"]).cumcount()
+    # cycle_lengths = df.groupby(["id", "cycle_id"])["cycle_day"].max().rename("cycle_total_days")
+    # df = df.merge(cycle_lengths, on=["id", "cycle_id"])
+    # df["cycle_pct"] = ((df["cycle_day"] / df["cycle_total_days"]) * 100).round(1)
+    # df["cycle_pct_bin"] = pd.cut(
+    #     df["cycle_pct"], bins=range(0, 105, 5), right=False, labels=range(0, 100, 5)
+    # )
+    # return df.drop(columns=["cycle_total_days"])
+    return df
 
 
 def reports_to_numeric(df: pd.DataFrame) -> pd.DataFrame:
@@ -126,6 +131,7 @@ def reports_to_numeric(df: pd.DataFrame) -> pd.DataFrame:
     scale_map = {v: i for i, v in enumerate(report_scale)}
     for col in SELFREPORT_FEATURES:
         if col != "flow_volume" and col in df.columns:
+            df.loc[df[col] == "Very Low", col] = "Very Low/Little"
             df[col] = df[col].map(scale_map).astype("Int64")
     return df
 
@@ -151,6 +157,29 @@ def add_rolling_features(df: pd.DataFrame, cols: list, lags: list) -> pd.DataFra
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
+def add_fitbit_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["lf_hf_ratio"] = df["hrv_lf_mean"] / df["hrv_hf_mean"]
+    return df
+
+
+def add_cycle_encoding(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["id", "day_in_study"]).copy()
+    mask = df["flow_volume"].ffill() >= 3
+    shifted1 = df.groupby("id")["flow_volume"].ffill().shift(-1) >= 2
+    consec = mask & shifted1
+    consec_start = consec & ~consec.shift(1)
+    df["group"] = consec_start.groupby(df["id"]).cumsum().ffill(limit=1)
+    regular = df.groupby(["id", "group"]).cumcount().astype("Int64")
+    reverse = 28 - df.groupby(["id", "group"]).cumcount(ascending=False).astype("Int64")
+    df["cycle_day"] = regular
+    df.loc[df["group"] == 0, "cycle_day"] = reverse[df["group"] == 0]
+
+    df["sin"] = np.sin((2 * np.pi * df["cycle_day"]) / 28)
+    df["cos"] = np.cos((2 * np.pi * df["cycle_day"]) / 28)
+    return df.drop(columns=["group", "cycle_day"])
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -161,6 +190,7 @@ def main(
     interday_input: Path = INTERDAY_INPUT,
     output_fitbit: Path = OUTPUT_FITBIT,
     output_selfreports: Path = OUTPUT_SELFREPORTS,
+    output_combined: Path = OUTPUT_COMBINED,
 ) -> None:
     logger.info("Starting feature engineering...")
 
@@ -172,9 +202,11 @@ def main(
     fitbit = df[SHARED_FEATURES + WEARABLE_FEATURES].copy()
     fitbit = impute_ffill(fitbit, WEARABLE_FEATURES, 3)
     fitbit = add_rolling_features(fitbit, WEARABLE_FEATURES, lags=[7, 14])
+    fitbit = add_fitbit_features(fitbit)
 
     selfreports = df[SHARED_FEATURES + SELFREPORT_FEATURES].copy()
     selfreports = reports_to_numeric(selfreports)
+    selfreports = add_cycle_encoding(selfreports)
     selfreports = impute_ffill(selfreports, SELFREPORT_FEATURES, 1)
     selfreports = add_rolling_features(selfreports, SELFREPORT_FEATURES, lags=[7, 14])
 
@@ -187,6 +219,12 @@ def main(
     selfreports.to_csv(output_selfreports, index=False)
     logger.success(
         f"Saved selfreport features: {output_selfreports} ({len(selfreports):,} rows, {selfreports.shape[1]} columns)"
+    )
+
+    combined = pd.merge(fitbit, selfreports, on=SHARED_FEATURES)
+    combined.to_csv(output_combined, index=False)
+    logger.success(
+        f"Saved selfreport features: {output_combined} ({len(combined):,} rows, {combined.shape[1]} columns)"
     )
 
 

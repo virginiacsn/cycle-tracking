@@ -36,6 +36,17 @@ def _make_datetime(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _flag_low_coverage(df: pd.DataFrame, col: str, source: str, threshold: int = 10) -> None:
+    """Log subjects with fewer than `threshold` non-NaN records for `col`."""
+    counts = df.groupby("id")[col].apply(lambda s: s.notna().sum())
+    low = counts[counts < threshold]
+    if not low.empty:
+        ids = ", ".join(f"id={i} ({n})" for i, n in low.items())
+        logger.warning(
+            f"{source}: {len(low)} subject(s) with <{threshold} non-NaN '{col}' records: {ids}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Interday loaders
 # ---------------------------------------------------------------------------
@@ -78,6 +89,8 @@ def _load_active_minutes() -> pd.DataFrame:
     ]
     for col in check:
         df.loc[(df[col] < 0), col] = pd.NA
+    df["wear_min_active"] = df[check].sum(axis=1, min_count=1)
+    _flag_low_coverage(df, "active_min_sedentary", "active_minutes")
     return df
 
 
@@ -108,7 +121,9 @@ def _load_computed_temperature() -> pd.DataFrame:
     df = df.sort_values("temperature_samples", ascending=False).drop_duplicates(
         subset=["id", "day_in_study"], keep="first"
     )
-    return df.drop(columns=["temperature_samples"])
+    df = df.drop(columns=["temperature_samples"])
+    _flag_low_coverage(df, "temperature", "computed_temperature")
+    return df
 
 
 def _load_demographic_vo2_max() -> pd.DataFrame:
@@ -120,6 +135,7 @@ def _load_demographic_vo2_max() -> pd.DataFrame:
     )
     df["vo2_max"] = pd.to_numeric(df["vo2_max"], errors="coerce")
     df.loc[(df["vo2_max"] < 10) | (df["vo2_max"] > 80), "vo2_max"] = pd.NA
+    _flag_low_coverage(df, "vo2_max", "demographic_vo2_max")
     return df
 
 
@@ -144,11 +160,13 @@ def _load_exercise() -> pd.DataFrame:
     # Raw duration is in milliseconds; divide by 60_000 to get minutes
     df["duration"] = df["duration"] / 60000.0
     df.loc[(df["duration"] < 0), "duration"] = pd.NA
-    return (
+    out = (
         df.groupby(["id", "day_in_study"])
         .agg(exercise_count=("duration", "count"), exercise_min=("duration", "sum"))
         .reset_index()
     )
+    _flag_low_coverage(out, "exercise_min", "exercise", 1)
+    return out
 
 
 def _load_heart_rate() -> pd.DataFrame:
@@ -158,7 +176,6 @@ def _load_heart_rate() -> pd.DataFrame:
     df = deduplicate_by_timestamp(df)
     df["bpm"] = pd.to_numeric(df["bpm"], errors="coerce")
     df.loc[(df["bpm"] < 30) | (df["bpm"] > 220), "bpm"] = pd.NA
-
     df = _make_datetime(df)
     # Resample to 5-min bins; non-null bin count × 5 later estimates minutes of device wear
     df = (
@@ -168,12 +185,9 @@ def _load_heart_rate() -> pd.DataFrame:
         .mean()
         .reset_index()
     )
-    df = (
-        df.groupby(["id", "day_in_study"])["bpm"]
-        .agg(hr="mean", wear_minutes="count")
-        .reset_index()
-    )
-    df["wear_minutes"] = df["wear_minutes"] * 5
+    df = df.groupby(["id", "day_in_study"])["bpm"].agg(hr="mean", wear_min="count").reset_index()
+    df["wear_min"] = df["wear_min"] * 5
+    _flag_low_coverage(df, "wear_min", "heart_rate")
     return df
 
 
@@ -212,6 +226,7 @@ def _load_heart_rate_variability() -> pd.DataFrame:
             }
         )
     )
+    _flag_low_coverage(df, "hrv_rmssd_mean", "heart_rate_variability")
     return df
 
 
@@ -226,6 +241,7 @@ def _load_hormones_and_selfreports() -> pd.DataFrame:
     # Check for implausible values
     for col in ["estrogen", "lh"]:
         df.loc[(df[col] <= 0), col] = pd.NA
+    _flag_low_coverage(df, "estrogen", "hormones_and_selfreport")
     return df
 
 
@@ -241,6 +257,7 @@ def _load_respiratory_rate() -> pd.DataFrame:
     df.loc[(df["respiratory_rate"] < 4) | (df["respiratory_rate"] > 30), "respiratory_rate"] = (
         pd.NA
     )
+    _flag_low_coverage(df, "respiratory_rate", "respiratory_rate")
     return df
 
 
@@ -251,6 +268,7 @@ def _load_resting_heart_rate() -> pd.DataFrame:
     df = df[["id", "day_in_study", "value"]].rename(columns={"value": "hr_resting"})
     df["hr_resting"] = pd.to_numeric(df["hr_resting"], errors="coerce")
     df.loc[(df["hr_resting"] < 30) | (df["hr_resting"] > 140), "hr_resting"] = pd.NA
+    _flag_low_coverage(df, "hr_resting", "resting_heart_rate")
     return df
 
 
@@ -313,9 +331,11 @@ def _load_sleep() -> pd.DataFrame:
     for col in check:
         df.loc[(df[col] < 0), col] = pd.NA
     # Some days have two mainsleep records (nap + overnight); keep the longer one
-    return df.sort_values("sleep_min_total", ascending=False).drop_duplicates(
+    df = df.sort_values("sleep_min_total", ascending=False).drop_duplicates(
         subset=["id", "day_in_study"], keep="first"
     )
+    _flag_low_coverage(df, "sleep_min_total", "sleep")
+    return df
 
 
 def _load_steps() -> pd.DataFrame:
@@ -334,6 +354,7 @@ def _load_steps() -> pd.DataFrame:
     )
     # Post-aggregation cap
     df.loc[df["step_count"] > 200_000, "step_count"] = pd.NA
+    _flag_low_coverage(df, "step_count", "steps")
     return df
 
 
@@ -352,7 +373,9 @@ def _load_wrist_temperature() -> pd.DataFrame:
     df.loc[(df["temperature_diff"] < -5) | (df["temperature_diff"] > 5), "temperature_diff"] = (
         pd.NA
     )
-    return df.groupby(["id", "day_in_study"])["temperature_diff"].mean().reset_index()
+    out = df.groupby(["id", "day_in_study"])["temperature_diff"].mean().reset_index()
+    _flag_low_coverage(out, "temperature_diff", "wrist_temperature")
+    return out
 
 
 def build_interday() -> pd.DataFrame:
