@@ -1,216 +1,263 @@
-"""Modeling pipeline: cycle phase classification from fitbit and self-reports."""
+"""Cycle phase classification training.
 
+Usage:
+    python -m src.modeling.train fitbit phase
+    python -m src.modeling.train combined phase --tune
+"""
+
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import warnings
 
 import joblib
-from lightgbm import LGBMClassifier
 from loguru import logger
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import GroupKFold
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
 import typer
-from xgboost import XGBClassifier
 
 from src.config import MODELS_DIR, PROCESSED_DATA_DIR
 from src.features import SHARED_FEATURES
+from src.modeling.classifiers import make_classifiers, tune_classifier
+from src.modeling.reporting import log_best_params, log_class_balance, log_summary
+from src.plots import plot_confusion_matrices
 
 app = typer.Typer()
 
 RESULTS_DIR = MODELS_DIR / "results"
-TARGET_LABEL = "phase_id"
-CV_FOLDS = 5
-RANDOM_STATE = 42
-
-# Columns that are not features (shared metadata + target)
 NON_FEATURE_COLS = set(SHARED_FEATURES)
 
-RQS: dict[str, Path] = {
-    "rq1_fitbit": PROCESSED_DATA_DIR / "interday_fitbit.csv",
-    "rq2_selfreports": PROCESSED_DATA_DIR / "interday_selfreports.csv",
+DATASET_PATHS = {
+    "fitbit": PROCESSED_DATA_DIR / "interday_fitbit.csv",
+    "selfreports": PROCESSED_DATA_DIR / "interday_selfreports.csv",
+    "combined": PROCESSED_DATA_DIR / "interday_combined.csv",
 }
 
+TASK_TARGETS = {
+    "phase": "phase_label",
+}
 
-# ---------------------------------------------------------------------------
-# Classifiers
-# ---------------------------------------------------------------------------
-
-
-def _make_classifiers() -> dict[str, Pipeline]:
-    def imputer():
-        return SimpleImputer(strategy="median")
-
-    return {
-        "logreg": Pipeline(
-            [
-                ("imputer", imputer()),
-                ("scaler", StandardScaler()),
-                ("clf", LogisticRegression(max_iter=1000, random_state=RANDOM_STATE)),
-            ]
-        ),
-        "random_forest": Pipeline(
-            [
-                ("imputer", imputer()),
-                (
-                    "clf",
-                    RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1),
-                ),
-            ]
-        ),
-        "xgboost": Pipeline(
-            [
-                ("imputer", imputer()),
-                (
-                    "clf",
-                    XGBClassifier(
-                        n_estimators=200,
-                        random_state=RANDOM_STATE,
-                        eval_metric="mlogloss",
-                        verbosity=0,
-                    ),
-                ),
-            ]
-        ),
-        "lightgbm": Pipeline(
-            [
-                ("imputer", imputer()),
-                (
-                    "clf",
-                    LGBMClassifier(n_estimators=200, random_state=RANDOM_STATE, verbose=-1),
-                ),
-            ]
-        ),
-    }
+BASE_METRICS = ["accuracy", "f1_macro", "precision_macro", "recall_macro", "auroc"]
 
 
-# ---------------------------------------------------------------------------
-# Cross-validation
-# ---------------------------------------------------------------------------
+def _feature_importances(pipe: Pipeline, feature_names: list[str]) -> dict | None:
+    clf = pipe.named_steps["clf"]
+    if hasattr(clf, "feature_importances_"):
+        return dict(zip(feature_names, clf.feature_importances_.round(6).tolist()))
+    if hasattr(clf, "coef_"):
+        coef = np.abs(clf.coef_).mean(axis=0)
+        return dict(zip(feature_names, coef.round(6).tolist()))
+    return None
 
 
-def cross_val_classify(
+def cross_val_loso(
     df: pd.DataFrame,
     features: list[str],
-    label: str = TARGET_LABEL,
-) -> tuple[pd.DataFrame, dict[str, Pipeline]]:
-    """GroupKFold CV by subject for all classifiers.
+    label: str,
+    tune: bool,
+) -> tuple[pd.DataFrame, dict[str, Pipeline], dict[str, np.ndarray]]:
+    """LOSO-CV for all classifiers.
 
-    Returns per-fold metrics DataFrame and final models trained on full data.
+    Returns per-subject metrics DataFrame and final models trained on full data.
     """
     available = [f for f in features if f in df.columns]
     subset = df.dropna(subset=available, how="all").copy()
     X = subset[available].astype(float)
     y = subset[label].values
     groups = subset["id"].values
+    n_classes = len(np.unique(y))
 
-    n_splits = min(CV_FOLDS, len(np.unique(groups)))
-    gkf = GroupKFold(n_splits=n_splits)
-    classifiers = _make_classifiers()
+    classifiers = make_classifiers()
 
-    X_arr = X.values
-
+    loso = LeaveOneGroupOut()
+    n_subjects = len(np.unique(groups))
     records = []
-    for fold, (train_idx, test_idx) in enumerate(gkf.split(X_arr, y, groups)):
-        for clf_name, pipe in classifiers.items():
-            p = clone(pipe)
+    oof_preds: dict[str, tuple[list, list]] = {name: ([], []) for name in classifiers}
+
+    fold_bar = tqdm(loso.split(X, y, groups), total=n_subjects, desc="LOSO", unit="subject")
+    for _, (train_idx, test_idx) in enumerate(fold_bar, 1):
+        left_out = groups[test_idx[0]]
+        fold_bar.set_postfix(subject=left_out)
+        X_train, y_train = X.iloc[train_idx], y[train_idx]
+        groups_train = groups[train_idx]
+
+        clf_bar = tqdm(classifiers.items(), desc=" Models", leave=False, unit="model")
+        for clf_name, base_pipe in clf_bar:
+            clf_bar.set_postfix(model=clf_name)
+            if tune:
+                pipe, best_params = tune_classifier(
+                    clf_name, base_pipe, X_train, y_train, groups_train
+                )
+            else:
+                pipe, best_params = clone(base_pipe), {}
+
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                p.fit(X.iloc[train_idx], y[train_idx])
-                y_pred = p.predict(X.iloc[test_idx])
-            records.append(
-                {
-                    "fold": fold,
-                    "model": clf_name,
-                    "accuracy": round(accuracy_score(y[test_idx], y_pred), 4),
-                    "f1_macro": round(
-                        f1_score(y[test_idx], y_pred, average="macro", zero_division=0), 4
-                    ),
-                    "f1_weighted": round(
-                        f1_score(y[test_idx], y_pred, average="weighted", zero_division=0),
-                        4,
-                    ),
-                    "n_test": int(len(test_idx)),
-                }
-            )
+                pipe.fit(X_train, y_train)
+                y_train_pred = pipe.predict(X_train)
+                y_train_proba = pipe.predict_proba(X_train)
+                y_pred = pipe.predict(X.iloc[test_idx])
+                y_proba = pipe.predict_proba(X.iloc[test_idx])
+
+            def _auroc(y_true: np.ndarray, proba: np.ndarray) -> float:
+                if n_classes > 2:
+                    return float(roc_auc_score(y_true, proba, multi_class="ovr", average="macro"))
+                return float(roc_auc_score(y_true, proba[:, 1]))
+
+            record: dict = {
+                "subject": left_out,
+                "model": clf_name,
+                "n_train": int(len(train_idx)),
+                "n_test": int(len(test_idx)),
+                # test metrics
+                "accuracy": round(accuracy_score(y[test_idx], y_pred), 4),
+                "f1_macro": round(
+                    f1_score(y[test_idx], y_pred, average="macro", zero_division=0), 4
+                ),
+                "precision_macro": round(
+                    precision_score(y[test_idx], y_pred, average="macro", zero_division=0), 4
+                ),
+                "recall_macro": round(
+                    recall_score(y[test_idx], y_pred, average="macro", zero_division=0), 4
+                ),
+                "auroc": round(_auroc(y[test_idx], y_proba), 4),
+                # train metrics
+                "train_accuracy": round(accuracy_score(y_train, y_train_pred), 4),
+                "train_f1_macro": round(
+                    f1_score(y_train, y_train_pred, average="macro", zero_division=0), 4
+                ),
+                "train_precision_macro": round(
+                    precision_score(y_train, y_train_pred, average="macro", zero_division=0), 4
+                ),
+                "train_recall_macro": round(
+                    recall_score(y_train, y_train_pred, average="macro", zero_division=0), 4
+                ),
+                "train_auroc": round(_auroc(y_train, y_train_proba), 4),
+                "best_params": json.dumps(best_params),
+                "feature_importances": json.dumps(_feature_importances(pipe, available)),
+            }
+
+            oof_preds[clf_name][0].extend(y[test_idx].tolist())
+            oof_preds[clf_name][1].extend(y_pred.tolist())
+            records.append(record)
+
+    classes = np.unique(y)
+    conf_matrices = {
+        name: confusion_matrix(true, pred, labels=classes)
+        for name, (true, pred) in oof_preds.items()
+    }
 
     final_models: dict[str, Pipeline] = {}
-    for clf_name, pipe in classifiers.items():
+    final_bar = tqdm(classifiers.items(), desc="Final models", unit="model")
+    for clf_name, base_pipe in final_bar:
+        final_bar.set_postfix(model=clf_name)
+        if tune:
+            pipe, _ = tune_classifier(clf_name, base_pipe, X, y, groups)
+        else:
+            pipe = clone(base_pipe)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             pipe.fit(X, y)
         final_models[clf_name] = pipe
 
-    return pd.DataFrame(records), final_models
-
-
-# ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
-
-
-def _log_summary(rq: str, results: pd.DataFrame) -> None:
-    for model_name, grp in results.groupby("model"):
-        acc = grp["accuracy"]
-        f1 = grp["f1_macro"]
-        logger.success(
-            f"  [{rq}] {model_name}: "
-            f"accuracy={acc.mean():.3f}±{acc.std():.3f}  "
-            f"f1_macro={f1.mean():.3f}±{f1.std():.3f}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+    return pd.DataFrame(records), final_models, conf_matrices
 
 
 @app.command()
 def main(
-    results_dir: Path = RESULTS_DIR,
+    dataset: str = typer.Argument(help="fitbit | selfreports | combined"),
+    task: str = typer.Argument(help="phase"),
+    tune: bool = typer.Option(False, "--t", help="Run Optuna hyperparameter search."),
+    results_dir: Path = typer.Option(RESULTS_DIR, help="Where to write CSVs and model files."),
+    comment: str = typer.Option("", "--c", help="Free-text note saved to runs.jsonl."),
 ) -> None:
+    if dataset not in DATASET_PATHS:
+        raise typer.BadParameter(f"dataset must be one of {sorted(DATASET_PATHS)}")
+    if task not in TASK_TARGETS:
+        raise typer.BadParameter(f"task must be one of {sorted(TASK_TARGETS)}")
+
+    features_path = DATASET_PATHS[dataset]
+    target = TASK_TARGETS[task]
+    exp_name = f"{dataset}_{task}" + ("_tune" if tune else "")
+
     results_dir.mkdir(parents=True, exist_ok=True)
-    models_dir = results_dir.parent
-    models_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    all_results: list[pd.DataFrame] = []
-    summary: dict[str, dict] = {}
+    if not features_path.exists():
+        logger.error(f"{features_path.name} not found — run the data pipeline first")
+        raise typer.Exit(1)
 
-    for rq_name, features_path in RQS.items():
-        logger.info(f"Running {rq_name} from {features_path.name}...")
-        df = pd.read_csv(features_path)
-        complete = df[df["is_full_cycle"].astype(bool)].copy()
-        logger.info(
-            f"  {len(complete):,} rows from {complete['id'].nunique()} subjects (full cycles only)"
+    df = pd.read_csv(features_path)
+
+    if target not in df.columns:
+        logger.error(
+            f"Target column '{target}' not in {features_path.name} — add it in features.py"
         )
+        raise typer.Exit(1)
 
-        features = [c for c in complete.columns if c not in NON_FEATURE_COLS]
-        results, final_models = cross_val_classify(complete, features, label=TARGET_LABEL)
-        results["rq"] = rq_name
-        results.to_csv(results_dir / f"{rq_name}.csv", index=False)
-        all_results.append(results)
+    logger.info(f"Running {exp_name}  tune={tune}")
+    logger.info(f"  {len(df):,} rows  {df['id'].nunique()} subjects")
+    log_class_balance(df, target, exp_name)
 
-        for clf_name, model in final_models.items():
-            joblib.dump(model, models_dir / f"{rq_name}_{clf_name}.pkl")
+    features = [c for c in df.columns if c not in NON_FEATURE_COLS]
+    results, final_models, conf_matrices = cross_val_loso(df, features, target, tune)
+    results["experiment"] = exp_name
 
-        _log_summary(rq_name, results)
+    results.to_csv(results_dir / f"{exp_name}.csv", index=False)
 
-        for model_name, grp in results.groupby("model"):
-            summary[f"{rq_name}_{model_name}"] = {
-                "accuracy": round(grp["accuracy"].mean(), 4),
-                "f1_macro": round(grp["f1_macro"].mean(), 4),
-            }
+    classes = np.unique(df[target].dropna())
+    plot_confusion_matrices(conf_matrices, classes, f"confusion_{exp_name}")
 
-    pd.concat(all_results, ignore_index=True).to_csv(results_dir / "all_results.csv", index=False)
-    (results_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    logger.success(f"All results saved to {results_dir}")
+    for clf_name, fitted_model in final_models.items():
+        joblib.dump(fitted_model, results_dir.parent / f"{exp_name}_{clf_name}.pkl")
+
+    log_summary(results, exp_name)
+    log_best_params({dataset: results}, exp_name)
+
+    metric_cols = BASE_METRICS
+    summary = {
+        f"{exp_name}_{m}": {
+            **{metric: round(grp[metric].mean(), 4) for metric in metric_cols},
+            "confusion_matrix": conf_matrices[m].tolist(),
+            "confusion_matrix_labels": classes.tolist(),
+        }
+        for m, grp in results.groupby("model")
+    }
+    (results_dir / f"{exp_name}_summary.json").write_text(json.dumps(summary, indent=2))
+
+    flat_results = {
+        f"{model}_{metric}": val
+        for model, metrics in summary.items()
+        for metric, val in metrics.items()
+        if not metric.startswith("confusion_matrix")
+    }
+    run_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "exp_name": exp_name,
+        "dataset": dataset,
+        "task": task,
+        "tune": tune,
+        "n_subjects": int(df["id"].nunique()),
+        "n_rows": len(df),
+        "comment": comment,
+        **flat_results,
+    }
+    with open(results_dir / "runs.jsonl", "a") as f:
+        f.write(json.dumps(run_entry) + "\n")
+
+    logger.success(f"Done — {results_dir}")
 
 
 if __name__ == "__main__":

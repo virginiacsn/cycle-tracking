@@ -12,6 +12,10 @@ src/archive/
 # Models and notebooks
 /models/
 /notebooks/
+/catboost_info/
+
+# Figures
+/reports/
 
 # Mac OS-specific storage files
 .DS_Store

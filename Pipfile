@@ -8,6 +8,8 @@ seaborn = "*"
 statsmodels = "*"
 xgboost = "*"
 lightgbm = "*"
+catboost = "*"
+optuna = "*"
 
 [dev-packages]
 
