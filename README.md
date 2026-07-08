@@ -30,17 +30,20 @@ make data
 │   ├── processed/         <- Final datasets for modeling
 │   └── external/          <- Third-party sources
 ├── notebooks/             <- Exploratory notebooks (not production code)
-├── reports/figures/       <- Generated figures
-├── models/                <- Serialized models
+├── reports/figures/       <- Generated figures (qc, diagnostics/, results/)
+├── models/                <- Serialized models + results/ (metrics, summaries, runs.jsonl)
 └── src/
     ├── config.py          <- Paths, env vars, logger
     ├── dataset.py         <- Raw → interday.csv (load, merge, clean)
     ├── qc.py              <- interday.csv → interday_qc.csv (wear time + day filters)
-    ├── features.py        <- interday_qc.csv → interday_fitbit.csv + interday_selfreports.csv
+    ├── features.py        <- interday_qc.csv → interday_fitbit.csv + interday_selfreports.csv + interday_combined.csv
     ├── plots.py           <- Visualizations
     └── modeling/
-        ├── train.py       <- GroupKFold CV training (logreg, RF, XGBoost, LightGBM)
-        └── predict.py     <- Inference
+        ├── classifiers.py <- Classifier pipelines + Optuna hyperparameter search
+        ├── train.py       <- LOSO-CV training (logreg, RF, XGBoost, CatBoost)
+        ├── predict.py     <- Inference
+        ├── diagnostics.py <- Model diagnostics
+        └── reporting.py   <- Logging/reporting helpers
 ```
 
 ## Development
