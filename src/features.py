@@ -73,6 +73,23 @@ SELFREPORT_FEATURES = [
     "flow_volume",
 ]
 
+FEATURE_GROUPS: dict[str, list[str]] = {
+    "Heart": ["hr", "hr_resting", "hrv_rmssd_mean", "hrv_hf_mean", "hrv_lf_mean", "lf_hf_ratio"],
+    "Sleep": [
+        "sleep_min_total",
+        "sleep_min_deep",
+        "sleep_min_light",
+        "sleep_min_rem",
+        "sleep_efficiency",
+    ],
+    "Activity": ["active_min_light", "active_min_moderate", "active_min_high", "step_count"],
+    "Body": ["temperature", "temperature_diff", "respiratory_rate", "vo2_max"],
+    "Menstrual": ["cramps", "flow_volume", "sorebreasts"],
+    "Stomach": ["appetite", "foodcravings", "indigestion", "bloating"],
+    "Symptoms": ["headaches", "fatigue", "sleepissue", "moodswing", "stress", "exerciselevel"],
+    "Position": ["sin", "cos"],
+}
+
 # ---------------------------------------------------------------------------
 # Feature functions
 # ---------------------------------------------------------------------------
@@ -180,6 +197,13 @@ def add_cycle_encoding(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["group", "cycle_day"])
 
 
+def z_score(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+    df = df.copy()
+    for col in cols:
+        df[col] = df.groupby("id")[col].transform(lambda x: (x - x.mean()) / x.std())
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -200,15 +224,16 @@ def main(
     df = add_cycle_features(df)
 
     fitbit = df[SHARED_FEATURES + WEARABLE_FEATURES].copy()
+    fitbit = z_score(fitbit, WEARABLE_FEATURES)
     fitbit = impute_ffill(fitbit, WEARABLE_FEATURES, 3)
     fitbit = add_rolling_features(fitbit, WEARABLE_FEATURES, lags=[7, 14])
     fitbit = add_fitbit_features(fitbit)
 
     selfreports = df[SHARED_FEATURES + SELFREPORT_FEATURES].copy()
     selfreports = reports_to_numeric(selfreports)
-    selfreports = add_cycle_encoding(selfreports)
     selfreports = impute_ffill(selfreports, SELFREPORT_FEATURES, 1)
     selfreports = add_rolling_features(selfreports, SELFREPORT_FEATURES, lags=[7, 14])
+    selfreports = add_cycle_encoding(selfreports)
 
     output_fitbit.parent.mkdir(parents=True, exist_ok=True)
     fitbit.to_csv(output_fitbit, index=False)
