@@ -1,9 +1,9 @@
-"""Fast model diagnostics that avoid full LOSO + Optuna runs.
+"""Fast model diagnostics that avoid full train + Optuna runs.
 
 Usage:
     python -m src.modeling.diagnostics gap
-    python -m src.modeling.diagnostics learning-curve fitbit --model random_forest
-    python -m src.modeling.diagnostics validation-curve combined --model xgboost
+    python -m src.modeling.diagnostics learning-curve fitbit --model logreg
+    python -m src.modeling.diagnostics validation-curve fitbit_hormones --model xgboost
 """
 
 import warnings
@@ -15,12 +15,14 @@ from sklearn.base import clone
 from sklearn.metrics import accuracy_score, f1_score
 import typer
 
-from src.modeling.classifiers import RANDOM_STATE, make_classifiers
+from src.features import DATASET_COMBOS, load_dataset, missing_dataset_files
+from src.modeling.classifiers import RANDOM_STATE, fit_classifier, make_classifiers
 from src.modeling.reporting import log_best_params
-from src.modeling.train import DATASET_PATHS, NON_FEATURE_COLS, RESULTS_DIR, TASK_TARGETS
+from src.modeling.train import NON_FEATURE_COLS, RESULTS_DIR, TARGET, subject_split
 from src.plots import (
     DIAGNOSTICS_FIGURES_DIR,
     MODEL_NAMES,
+    TEST_METRICS,
     plot_learning_curve,
     plot_train_test_gap,
     plot_validation_curve,
@@ -31,39 +33,45 @@ app = typer.Typer()
 # One complexity knob per classifier: param name, values to sweep, log-scale x-axis.
 COMPLEXITY_PARAM: dict[str, tuple[str, list[float], bool]] = {
     "logreg": ("clf__C", [0.001, 0.01, 0.1, 1.0, 10.0], True),
-    "random_forest": ("clf__max_depth", [3, 5, 8, 12, 20, 22], False),
     "xgboost": ("clf__max_depth", [2, 3, 4, 6, 8], False),
-    "catboost": ("clf__depth", [2, 3, 4, 6, 8], False),
 }
 
 
 def _load_dataset(dataset: str) -> tuple[pd.DataFrame, list[str], str]:
-    features_path = DATASET_PATHS[dataset]
-    if not features_path.exists():
-        logger.error(f"{features_path.name} not found — run the data pipeline first")
+    missing = missing_dataset_files(dataset)
+    if missing:
+        logger.error(f"Missing base dataset file(s) {missing} — run the data pipeline first")
         raise typer.Exit(1)
 
-    df = pd.read_csv(features_path)
-    target = TASK_TARGETS["phase"]
+    df = load_dataset(dataset)
     features = [c for c in df.columns if c not in NON_FEATURE_COLS]
     subset = df.dropna(subset=features, how="all").copy()
-    return subset, features, target
+    return subset, features, TARGET
+
+
+def _load_all_results() -> dict[str, pd.DataFrame]:
+    """Read every existing `{dataset}_results.csv`, keyed by dataset. No training."""
+    results_by_dataset = {}
+    for dataset in DATASET_COMBOS:
+        path = RESULTS_DIR / f"{dataset}_results.csv"
+        if not path.exists():
+            logger.warning(f"Skipping {dataset}: {path.name} not found")
+            continue
+        results_by_dataset[dataset] = pd.read_csv(path)
+    return results_by_dataset
 
 
 def _train_val_split(df: pd.DataFrame, val_frac: float, seed: int) -> tuple[list, list]:
+    """Shuffle subjects and split into train/validation subject-ID lists (no held-out test)."""
     subjects = df["id"].unique()
-    rng = np.random.default_rng(seed)
-    rng.shuffle(subjects)
-    n_val = max(1, int(len(subjects) * val_frac))
-    val_subjects = subjects[:n_val].tolist()
-    train_subjects = subjects[n_val:].tolist()
-    return train_subjects, val_subjects
+    train_mask, val_mask, _ = subject_split(subjects, val_frac=val_frac, test_frac=0, seed=seed)
+    return subjects[train_mask].tolist(), subjects[val_mask].tolist()
 
 
-def _fit_and_score(pipe, X_train, y_train, X_val, y_val) -> dict:
+def _fit_and_score(clf_name, pipe, X_train, y_train, X_val, y_val) -> dict:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        pipe.fit(X_train, y_train)
+        fit_classifier(clf_name, pipe, X_train, y_train, X_val, y_val)
     train_pred = pipe.predict(X_train)
     val_pred = pipe.predict(X_val)
     return {
@@ -79,57 +87,41 @@ def _fit_and_score(pipe, X_train, y_train, X_val, y_val) -> dict:
 
 
 @app.command()
-def gap(
-    tune: bool = typer.Option(True, "--tune/--no-tune", help="Read tuned or untuned result CSVs."),
-) -> None:
-    """Plot train-minus-test metric gaps from existing LOSO result CSVs. No training."""
-    suffix = "_tune" if tune else ""
-    frames = []
-    for dataset in DATASET_PATHS:
-        path = RESULTS_DIR / f"{dataset}_phase{suffix}.csv"
-        if not path.exists():
-            logger.warning(f"Skipping {dataset}: {path.name} not found")
-            continue
-        result = pd.read_csv(path)
-        result["dataset"] = dataset
-        frames.append(result)
-
-    if not frames:
-        logger.error("No result CSVs found — run src.modeling.train first")
-        raise typer.Exit(1)
-
-    combined = pd.concat(frames, ignore_index=True)
-    combined["model"] = combined["model"].map(MODEL_NAMES)
-    fig_name = f"eval_gap{suffix}"
-    plot_train_test_gap(combined, ["accuracy", "f1_macro", "auroc"], fig_name)
-    logger.success(f"Saved {DIAGNOSTICS_FIGURES_DIR / fig_name}.png")
-
-
-@app.command("best-params")
-def best_params(
-    tune: bool = typer.Option(True, "--tune/--no-tune", help="Read tuned or untuned result CSVs."),
-) -> None:
-    """Print tuned hyperparameters per model from existing LOSO result CSVs. No training."""
-    suffix = "_tune" if tune else ""
-    results_by_dataset = {}
-    for dataset in DATASET_PATHS:
-        path = RESULTS_DIR / f"{dataset}_phase{suffix}.csv"
-        if not path.exists():
-            logger.warning(f"Skipping {dataset}: {path.name} not found")
-            continue
-        results_by_dataset[dataset] = pd.read_csv(path)
-
+def gap() -> None:
+    """Plot train-minus-test metric gaps from existing result CSVs. No training."""
+    results_by_dataset = _load_all_results()
     if not results_by_dataset:
         logger.error("No result CSVs found — run src.modeling.train first")
         raise typer.Exit(1)
 
-    log_best_params(results_by_dataset, f"phase{suffix}")
+    frames = []
+    for dataset, result in results_by_dataset.items():
+        result = result.copy()
+        result["dataset"] = dataset
+        frames.append(result)
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined["model"] = combined["model"].map(MODEL_NAMES)
+    fig_name = "eval_gap"
+    plot_train_test_gap(combined, TEST_METRICS, fig_name)
+    logger.success(f"Saved {DIAGNOSTICS_FIGURES_DIR / fig_name}.png")
+
+
+@app.command("best-params")
+def best_params() -> None:
+    """Print tuned hyperparameters per model from existing result CSVs. No training."""
+    results_by_dataset = _load_all_results()
+    if not results_by_dataset:
+        logger.error("No result CSVs found — run src.modeling.train first")
+        raise typer.Exit(1)
+
+    log_best_params(results_by_dataset, "phase")
 
 
 @app.command("learning-curve")
 def learning_curve(
-    dataset: str = typer.Argument(help="fitbit | selfreports | combined"),
-    model: str = typer.Option("random_forest", help="logreg | random_forest | xgboost | catboost"),
+    dataset: str = typer.Argument(help=f"one of {sorted(DATASET_COMBOS)}"),
+    model: str = typer.Option("logreg", help="logreg | xgboost"),
     subject_counts: str = typer.Option(
         "5,10,15,20,30", help="Comma-separated training subject counts."
     ),
@@ -140,8 +132,8 @@ def learning_curve(
     seed: int = typer.Option(RANDOM_STATE),
 ) -> None:
     """Train vs validation score as training-subject count grows. Untuned baseline classifier only."""
-    if dataset not in DATASET_PATHS:
-        raise typer.BadParameter(f"dataset must be one of {sorted(DATASET_PATHS)}")
+    if dataset not in DATASET_COMBOS:
+        raise typer.BadParameter(f"dataset must be one of {sorted(DATASET_COMBOS)}")
     classifiers = make_classifiers()
     if model not in classifiers:
         raise typer.BadParameter(f"model must be one of {sorted(classifiers)}")
@@ -165,7 +157,7 @@ def learning_curve(
             X_train = df.loc[train_mask, features].astype(float)
             y_train = df.loc[train_mask, target].values
 
-            scores = _fit_and_score(clone(base_pipe), X_train, y_train, X_val, y_val)
+            scores = _fit_and_score(model, clone(base_pipe), X_train, y_train, X_val, y_val)
             for split, metrics in scores.items():
                 records.append({"n_subjects": size, "rep": rep, "split": split, **metrics})
 
@@ -177,16 +169,16 @@ def learning_curve(
 
 @app.command("validation-curve")
 def validation_curve(
-    dataset: str = typer.Argument(help="fitbit | selfreports | combined"),
-    model: str = typer.Option("random_forest", help="logreg | random_forest | xgboost | catboost"),
+    dataset: str = typer.Argument(help=f"one of {sorted(DATASET_COMBOS)}"),
+    model: str = typer.Option("logreg", help="logreg | xgboost"),
     val_frac: float = typer.Option(
         0.2, help="Fraction of subjects held out as a fixed validation set."
     ),
     seed: int = typer.Option(RANDOM_STATE),
 ) -> None:
     """Train vs validation score across one hyperparameter, fixed train/validation subject split."""
-    if dataset not in DATASET_PATHS:
-        raise typer.BadParameter(f"dataset must be one of {sorted(DATASET_PATHS)}")
+    if dataset not in DATASET_COMBOS:
+        raise typer.BadParameter(f"dataset must be one of {sorted(DATASET_COMBOS)}")
     if model not in COMPLEXITY_PARAM:
         raise typer.BadParameter(f"model must be one of {sorted(COMPLEXITY_PARAM)}")
 
@@ -207,7 +199,7 @@ def validation_curve(
     for value in param_values:
         pipe = clone(base_pipe)
         pipe.set_params(**{param_name: value})
-        scores = _fit_and_score(pipe, X_train, y_train, X_val, y_val)
+        scores = _fit_and_score(model, pipe, X_train, y_train, X_val, y_val)
         for split, metrics in scores.items():
             records.append({"param_value": value, "split": split, **metrics})
 

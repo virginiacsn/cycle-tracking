@@ -9,6 +9,9 @@ src/archive/
 .context/
 .rules/
 
+# Editor
+.vscode/
+
 # Models and notebooks
 /models/
 /notebooks/

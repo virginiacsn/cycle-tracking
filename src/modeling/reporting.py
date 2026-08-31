@@ -27,22 +27,21 @@ def log_class_balance(df: pd.DataFrame, label: str, name: str) -> None:
 
 
 def log_summary(results: pd.DataFrame, name: str) -> None:
-    for model_name, grp in results.groupby("model"):
+    for _, row in results.iterrows():
         logger.success(
-            f"  [{name}] {model_name}: "
-            f"accuracy={grp['accuracy'].mean():.3f}±{grp['accuracy'].std():.3f}  "
-            f"f1_macro={grp['f1_macro'].mean():.3f}±{grp['f1_macro'].std():.3f}  "
-            f"precision={grp['precision_macro'].mean():.3f}±{grp['precision_macro'].std():.3f}  "
-            f"recall={grp['recall_macro'].mean():.3f}±{grp['recall_macro'].std():.3f}  "
-            f"auroc={grp['auroc'].mean():.3f}±{grp['auroc'].std():.3f}  "
-            f"[train] accuracy={grp['train_accuracy'].mean():.3f} f1={grp['train_f1_macro'].mean():.3f}"
+            f"  [{name}] {row['model']}: "
+            f"accuracy={row['accuracy']:.3f}  "
+            f"f1_macro={row['f1_macro']:.3f}  "
+            f"recall={row['recall_macro']:.3f}  "
+            f"auroc={row['auroc']:.3f}  "
+            f"[train] accuracy={row['train_accuracy']:.3f} f1={row['train_f1_macro']:.3f}"
         )
 
 
 def log_best_params(results_by_dataset: dict[str, pd.DataFrame], name: str) -> None:
-    """Log tuned-hyperparameter median/std across LOSO folds, one table per model.
+    """Log tuned hyperparameters per model, one table per model.
 
-    Each table has params as rows and (dataset, median/std) as columns.
+    Each table has params as rows and datasets as columns.
     """
     by_model: dict[str, dict[str, pd.DataFrame]] = {}
     for dataset, results in results_by_dataset.items():
@@ -54,17 +53,11 @@ def log_best_params(results_by_dataset: dict[str, pd.DataFrame], name: str) -> N
             by_model.setdefault(model_name, {})[dataset] = params
 
     if not by_model:
-        logger.info(f"  [{name}] no tuned params to show (run with --tune)")
+        logger.info(f"  [{name}] no tuned params to show")
         return
 
     for model_name in sorted(by_model):
         table = pd.DataFrame(
-            {
-                (dataset, stat): getattr(params, stat)().round(4)
-                for dataset, params in by_model[model_name].items()
-                for stat in ("median", "std")
-            }
-        ).sort_index(axis=1, level=0)
-        logger.info(
-            f"  [{name}] {model_name} best params (median/std):\n{table.to_string(na_rep='')}"
-        )
+            {dataset: params.iloc[0] for dataset, params in by_model[model_name].items()}
+        ).sort_index(axis=1)
+        logger.info(f"  [{name}] {model_name} best params:\n{table.to_string(na_rep='')}")

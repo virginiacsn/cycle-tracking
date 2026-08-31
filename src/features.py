@@ -1,5 +1,6 @@
 """Feature engineering pipeline for cycle tracking."""
 
+from itertools import combinations
 from pathlib import Path
 
 from loguru import logger
@@ -14,14 +15,32 @@ app = typer.Typer()
 INTERDAY_INPUT = PROCESSED_DATA_DIR / "interday_qc.csv"
 OUTPUT_FITBIT = PROCESSED_DATA_DIR / "interday_fitbit.csv"
 OUTPUT_SELFREPORTS = PROCESSED_DATA_DIR / "interday_selfreports.csv"
-OUTPUT_COMBINED = PROCESSED_DATA_DIR / "interday_combined.csv"
+OUTPUT_HORMONES = PROCESSED_DATA_DIR / "interday_hormones.csv"
+
+DATASET_PATHS: dict[str, Path] = {
+    "fitbit": OUTPUT_FITBIT,
+    "hormones": OUTPUT_HORMONES,
+    "selfreports": OUTPUT_SELFREPORTS,
+}
+
+
+def dataset_key(components: tuple[str, ...]) -> str:
+    return "_".join(sorted(components))
+
+
+# Every combination of the base datasets, e.g. "fitbit_hormones" -> ("fitbit", "hormones"),
+# used to compare model performance across dataset combinations.
+DATASET_COMBOS: dict[str, tuple[str, ...]] = {
+    dataset_key(combo): combo
+    for r in range(1, len(DATASET_PATHS) + 1)
+    for combo in combinations(DATASET_PATHS, r)
+}
 
 SHARED_FEATURES = [
     "id",
     "day_in_study",
     "phase",
     "phase_label",
-    "fertility_label",
     "cycle_id",
     "is_full_cycle",
 ]
@@ -57,6 +76,11 @@ WEARABLE_FEATURES = [
     "vo2_max",
 ]
 
+HORMONE_FEATURES = [
+    "lh",
+    "estrogen",
+]
+
 SELFREPORT_FEATURES = [
     "appetite",
     "exerciselevel",
@@ -84,11 +108,30 @@ FEATURE_GROUPS: dict[str, list[str]] = {
     ],
     "Activity": ["active_min_light", "active_min_moderate", "active_min_high", "step_count"],
     "Body": ["temperature", "temperature_diff", "respiratory_rate", "vo2_max"],
+    "Hormone": ["lh", "estrogen"],
     "Menstrual": ["cramps", "flow_volume", "sorebreasts"],
     "Stomach": ["appetite", "foodcravings", "indigestion", "bloating"],
     "Symptoms": ["headaches", "fatigue", "sleepissue", "moodswing", "stress", "exerciselevel"],
     "Position": ["sin", "cos"],
 }
+
+
+def missing_dataset_files(key: str) -> list[Path]:
+    """Base dataset file(s) for `key` that don't exist yet (run the data pipeline first)."""
+    return [DATASET_PATHS[c] for c in DATASET_COMBOS[key] if not DATASET_PATHS[c].exists()]
+
+
+def load_dataset(key: str) -> pd.DataFrame:
+    """Load a base dataset, or merge components on the fly for combo keys (e.g. "fitbit_hormones")."""
+    if key not in DATASET_COMBOS:
+        raise ValueError(f"Unknown dataset '{key}' — must be one of {sorted(DATASET_COMBOS)}")
+    components = DATASET_COMBOS[key]
+    frames = [pd.read_csv(DATASET_PATHS[c]) for c in components]
+    merged = frames[0]
+    for frame in frames[1:]:
+        merged = pd.merge(merged, frame, on=SHARED_FEATURES)
+    return merged
+
 
 # ---------------------------------------------------------------------------
 # Feature functions
@@ -100,8 +143,6 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
     df["phase_label"] = pd.Categorical(
         df["phase"], categories=["Menstrual", "Follicular", "Fertility", "Luteal"]
     ).codes
-
-    df["fertility_label"] = (df["phase"] == "Fertility").astype("Int64")
 
     # conditions = [
     #     df["phase"] == "Menstrual",
@@ -180,6 +221,12 @@ def add_fitbit_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_hormone_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["estrogen_lh_ratio"] = df["estrogen"] / df["lh"]
+    return df
+
+
 def add_cycle_encoding(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values(["id", "day_in_study"]).copy()
     mask = df["flow_volume"].ffill() >= 3
@@ -214,7 +261,7 @@ def main(
     interday_input: Path = INTERDAY_INPUT,
     output_fitbit: Path = OUTPUT_FITBIT,
     output_selfreports: Path = OUTPUT_SELFREPORTS,
-    output_combined: Path = OUTPUT_COMBINED,
+    output_hormones: Path = OUTPUT_HORMONES,
 ) -> None:
     logger.info("Starting feature engineering...")
 
@@ -235,6 +282,12 @@ def main(
     selfreports = add_rolling_features(selfreports, SELFREPORT_FEATURES, lags=[7, 14])
     selfreports = add_cycle_encoding(selfreports)
 
+    hormones = df[SHARED_FEATURES + HORMONE_FEATURES].copy()
+    hormones = z_score(hormones, HORMONE_FEATURES)
+    hormones = impute_ffill(hormones, HORMONE_FEATURES, 1)
+    hormones = add_rolling_features(hormones, HORMONE_FEATURES, lags=[7, 14])
+    hormones = add_hormone_features(hormones)
+
     output_fitbit.parent.mkdir(parents=True, exist_ok=True)
     fitbit.to_csv(output_fitbit, index=False)
     logger.success(
@@ -246,10 +299,9 @@ def main(
         f"Saved selfreport features: {output_selfreports} ({len(selfreports):,} rows, {selfreports.shape[1]} columns)"
     )
 
-    combined = pd.merge(fitbit, selfreports, on=SHARED_FEATURES)
-    combined.to_csv(output_combined, index=False)
+    hormones.to_csv(output_hormones, index=False)
     logger.success(
-        f"Saved selfreport features: {output_combined} ({len(combined):,} rows, {combined.shape[1]} columns)"
+        f"Saved hormone features: {output_hormones} ({len(hormones):,} rows, {hormones.shape[1]} columns)"
     )
 
 

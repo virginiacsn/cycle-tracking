@@ -40,12 +40,6 @@ format:
 
 
 
-## Run tests
-.PHONY: test
-test:
-	python -m pytest tests
-
-
 ## Set up Python interpreter environment
 .PHONY: create_environment
 create_environment:
@@ -69,6 +63,11 @@ data: requirements
 .PHONY: qc
 qc: data
 	$(PYTHON_INTERPRETER) src/qc.py
+
+## Train models on every dataset combination
+.PHONY: train
+train:
+	$(PYTHON_INTERPRETER) -m src.modeling.train all
 
 
 #################################################################################

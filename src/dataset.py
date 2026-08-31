@@ -250,13 +250,28 @@ def _load_respiratory_rate() -> pd.DataFrame:
     df = pd.read_csv(RAW_DATA_DIR / "respiratory_rate_summary.csv")
     df = df[df["study_interval"] == STUDY_INTERVAL].copy()
     df = deduplicate_by_timestamp(df)
-    df = df[["id", "day_in_study", "full_sleep_breathing_rate"]].rename(
+
+    # Some days have both a nap and the overnight sleep session summarized; identify the
+    # overnight one by matching its timestamp to the mainsleep session's end in sleep.csv
+    sleep = pd.read_csv(RAW_DATA_DIR / "sleep.csv")
+    sleep = sleep[(sleep["study_interval"] == STUDY_INTERVAL) & (sleep["mainsleep"])]
+    overnight_keys = sleep.rename(
+        columns={"sleep_end_day_in_study": "day_in_study", "sleep_end_timestamp": "timestamp"}
+    )[["id", "day_in_study", "timestamp"]].assign(is_overnight=True)
+    df = df.merge(overnight_keys, on=["id", "day_in_study", "timestamp"], how="left")
+    df["is_overnight"] = df["is_overnight"].fillna(False)
+
+    df = df[["id", "day_in_study", "full_sleep_breathing_rate", "is_overnight"]].rename(
         columns={"full_sleep_breathing_rate": "respiratory_rate"}
     )
     df["respiratory_rate"] = pd.to_numeric(df["respiratory_rate"], errors="coerce")
     df.loc[(df["respiratory_rate"] < 4) | (df["respiratory_rate"] > 30), "respiratory_rate"] = (
         pd.NA
     )
+    df = df.sort_values("is_overnight", ascending=False).drop_duplicates(
+        subset=["id", "day_in_study"], keep="first"
+    )
+    df = df.drop(columns=["is_overnight"])
     _flag_low_coverage(df, "respiratory_rate", "respiratory_rate")
     return df
 

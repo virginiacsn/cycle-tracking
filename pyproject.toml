@@ -24,7 +24,6 @@ dependencies = [
     "numpy",
     "pandas",
     "pip",
-    "pytest",
     "python-dotenv",
     "ruff",
     "scikit-learn",

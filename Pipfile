@@ -7,8 +7,6 @@ name = "pypi"
 seaborn = "*"
 statsmodels = "*"
 xgboost = "*"
-lightgbm = "*"
-catboost = "*"
 optuna = "*"
 
 [dev-packages]
